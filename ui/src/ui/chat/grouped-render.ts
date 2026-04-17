@@ -1,10 +1,6 @@
 import { html, nothing } from "lit";
 import { unsafeHTML } from "lit/directives/unsafe-html.js";
 import { until } from "lit/directives/until.js";
-import {
-  DEFAULT_INLINE_IMAGE_THUMBNAIL_MAX_HEIGHT,
-  DEFAULT_INLINE_IMAGE_THUMBNAIL_MAX_WIDTH,
-} from "../../../../src/shared/managed-image-thumbnail-limits.js";
 import { getSafeLocalStorage } from "../../local-storage.ts";
 import type { AssistantIdentity } from "../assistant-identity.ts";
 import type { EmbedSandboxMode } from "../embed-sandbox.ts";
@@ -60,6 +56,9 @@ type ImageBlock = {
   width?: number;
   height?: number;
 };
+
+const DEFAULT_INLINE_IMAGE_PREVIEW_MAX_WIDTH = 480;
+const DEFAULT_INLINE_IMAGE_PREVIEW_MAX_HEIGHT = 480;
 
 function normalizeMarkdownLinkTarget(target: string): string {
   const trimmed = target.trim();
@@ -144,8 +143,8 @@ function imageDisplayStyle(img: ImageBlock): string {
   const width = normalizePositiveDimension(img.width);
   const height = normalizePositiveDimension(img.height);
   const styles = [
-    `--chat-message-image-default-width: ${DEFAULT_INLINE_IMAGE_THUMBNAIL_MAX_WIDTH}`,
-    `--chat-message-image-default-height: ${DEFAULT_INLINE_IMAGE_THUMBNAIL_MAX_HEIGHT}`,
+    `--chat-message-image-default-width: ${DEFAULT_INLINE_IMAGE_PREVIEW_MAX_WIDTH}`,
+    `--chat-message-image-default-height: ${DEFAULT_INLINE_IMAGE_PREVIEW_MAX_HEIGHT}`,
   ];
   if (width && height) {
     styles.push(`--chat-message-image-width: ${width}`);

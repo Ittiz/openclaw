@@ -1,8 +1,16 @@
-import fs from "node:fs/promises";
-import path from "node:path";
-import type { IncomingMessage, ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
+import fs from "node:fs/promises";
+import type { IncomingMessage, ServerResponse } from "node:http";
+import path from "node:path";
+import { getLatestSubagentRunByChildSessionKey } from "../agents/subagent-registry.js";
 import { resolveStateDir } from "../config/paths.js";
+import {
+  getImageMetadata,
+  hasAlphaChannel,
+  resizeToJpeg,
+  resizeToPng,
+} from "../media/image-ops.js";
+import { saveMediaBuffer, saveMediaSource } from "../media/store.js";
 import type { AuthRateLimiter } from "./auth-rate-limit.js";
 import type { ResolvedGatewayAuth } from "./auth.js";
 import { sendJson, sendMethodNotAllowed } from "./http-common.js";
@@ -11,23 +19,9 @@ import {
   resolveOpenAiCompatibleHttpOperatorScopes,
 } from "./http-utils.js";
 import { authorizeOperatorScopesForMethod } from "./method-scopes.js";
-import {
-  getImageMetadata,
-  hasAlphaChannel,
-  resizeToJpeg,
-  resizeToPng,
-} from "../media/image-ops.js";
-import { saveMediaBuffer, saveMediaSource } from "../media/store.js";
-import { getLatestSubagentRunByChildSessionKey } from "../agents/subagent-registry.js";
 import { loadSessionEntry, readSessionMessages } from "./session-utils.js";
-import {
-  DEFAULT_INLINE_IMAGE_THUMBNAIL_MAX_DIMENSION,
-  DEFAULT_INLINE_IMAGE_THUMBNAIL_MAX_HEIGHT,
-  DEFAULT_INLINE_IMAGE_THUMBNAIL_MAX_WIDTH,
-} from "../shared/managed-image-thumbnail-limits.js";
 
 const OUTGOING_IMAGE_ROUTE_PREFIX = "/api/chat/media/outgoing";
-const THUMBNAIL_QUALITY = 82;
 const DEFAULT_TRANSIENT_OUTGOING_IMAGE_TTL_MS = 15 * 60 * 1000;
 
 export const DEFAULT_MANAGED_IMAGE_ATTACHMENT_LIMITS = {
@@ -35,9 +29,6 @@ export const DEFAULT_MANAGED_IMAGE_ATTACHMENT_LIMITS = {
   maxWidth: 4096,
   maxHeight: 4096,
   maxPixels: 20_000_000,
-  thumbnailMaxDimension: DEFAULT_INLINE_IMAGE_THUMBNAIL_MAX_DIMENSION,
-  thumbnailMaxWidth: DEFAULT_INLINE_IMAGE_THUMBNAIL_MAX_WIDTH,
-  thumbnailMaxHeight: DEFAULT_INLINE_IMAGE_THUMBNAIL_MAX_HEIGHT,
 } as const;
 
 export type ManagedImageAttachmentLimits = {
@@ -45,22 +36,10 @@ export type ManagedImageAttachmentLimits = {
   maxWidth: number;
   maxHeight: number;
   maxPixels: number;
-  thumbnailMaxDimension: number;
-  thumbnailMaxWidth: number;
-  thumbnailMaxHeight: number;
 };
 
 type ManagedImageAttachmentLimitsConfig = Partial<
-  Pick<
-    ManagedImageAttachmentLimits,
-    | "maxBytes"
-    | "maxWidth"
-    | "maxHeight"
-    | "maxPixels"
-    | "thumbnailMaxDimension"
-    | "thumbnailMaxWidth"
-    | "thumbnailMaxHeight"
-  >
+  Pick<ManagedImageAttachmentLimits, "maxBytes" | "maxWidth" | "maxHeight" | "maxPixels">
 >;
 
 type ManagedImageRecordVariant = {
@@ -83,7 +62,6 @@ type ManagedImageRecord = {
   retentionClass?: ManagedImageRetentionClass;
   alt: string;
   original: ManagedImageRecordVariant;
-  thumbnail: ManagedImageRecordVariant;
 };
 
 type ParsedImageDataUrl =
@@ -102,22 +80,11 @@ type CleanupManagedOutgoingImageRecordsResult = {
 export function resolveManagedImageAttachmentLimits(
   config?: ManagedImageAttachmentLimitsConfig | null,
 ): ManagedImageAttachmentLimits {
-  const thumbnailMaxDimension =
-    config?.thumbnailMaxDimension ?? DEFAULT_MANAGED_IMAGE_ATTACHMENT_LIMITS.thumbnailMaxDimension;
   return {
     maxBytes: config?.maxBytes ?? DEFAULT_MANAGED_IMAGE_ATTACHMENT_LIMITS.maxBytes,
     maxWidth: config?.maxWidth ?? DEFAULT_MANAGED_IMAGE_ATTACHMENT_LIMITS.maxWidth,
     maxHeight: config?.maxHeight ?? DEFAULT_MANAGED_IMAGE_ATTACHMENT_LIMITS.maxHeight,
     maxPixels: config?.maxPixels ?? DEFAULT_MANAGED_IMAGE_ATTACHMENT_LIMITS.maxPixels,
-    thumbnailMaxDimension,
-    thumbnailMaxWidth:
-      config?.thumbnailMaxWidth ??
-      config?.thumbnailMaxDimension ??
-      DEFAULT_MANAGED_IMAGE_ATTACHMENT_LIMITS.thumbnailMaxWidth,
-    thumbnailMaxHeight:
-      config?.thumbnailMaxHeight ??
-      config?.thumbnailMaxDimension ??
-      DEFAULT_MANAGED_IMAGE_ATTACHMENT_LIMITS.thumbnailMaxHeight,
   };
 }
 
@@ -189,17 +156,6 @@ function getManagedImageMetadataLimitError(
     return `Managed image attachment ${JSON.stringify(alt)} exceeds the ${limits.maxPixels.toLocaleString("en-US")} pixel limit`;
   }
   return null;
-}
-
-function validateManagedImageMetadata(
-  metadata: { width: number; height: number } | null,
-  alt: string,
-  limits: ManagedImageAttachmentLimits,
-): void {
-  const error = getManagedImageMetadataLimitError(metadata, alt, limits);
-  if (error) {
-    throw createManagedImageAttachmentError(error);
-  }
 }
 
 function computeManagedImageResizeTarget(
@@ -282,19 +238,11 @@ function resolveOutgoingOriginalsDir(stateDir = resolveStateDir()) {
   return path.join(stateDir, "media", "outgoing", "originals");
 }
 
-function resolveOutgoingThumbnailsDir(stateDir = resolveStateDir()) {
-  return path.join(stateDir, "media", "outgoing", "thumbs");
-}
-
 function resolveOutgoingRecordPath(attachmentId: string, stateDir = resolveStateDir()) {
   return path.join(resolveOutgoingRecordsDir(stateDir), `${attachmentId}.json`);
 }
 
-function buildOutgoingVariantUrl(
-  sessionKey: string,
-  attachmentId: string,
-  variant: "thumb" | "full" | "download",
-) {
+function buildOutgoingVariantUrl(sessionKey: string, attachmentId: string, variant: "full") {
   return `${OUTGOING_IMAGE_ROUTE_PREFIX}/${encodeURIComponent(sessionKey)}/${attachmentId}/${variant}`;
 }
 
@@ -338,19 +286,6 @@ function deriveAltText(source: string, index: number) {
   return localName || fallback;
 }
 
-function shouldCopyOriginalAsThumbnail(params: {
-  metadata: { width: number; height: number } | null;
-  limits: ManagedImageAttachmentLimits;
-}) {
-  if (!params.metadata) {
-    return false;
-  }
-  return (
-    params.metadata.width <= params.limits.thumbnailMaxWidth &&
-    params.metadata.height <= params.limits.thumbnailMaxHeight
-  );
-}
-
 function parseImageDataUrl(source: string): ParsedImageDataUrl {
   const trimmed = source.trim();
   if (!trimmed.startsWith("data:")) {
@@ -373,7 +308,10 @@ function parseImageDataUrl(source: string): ParsedImageDataUrl {
 
 async function getVariantStats(filePath: string) {
   const [stats, metadataBuffer] = await Promise.all([fs.stat(filePath), fs.readFile(filePath)]);
-  const metadata = await getImageMetadata(metadataBuffer).catch(() => ({ width: null, height: null }));
+  const metadata = await getImageMetadata(metadataBuffer).catch(() => ({
+    width: null,
+    height: null,
+  }));
   return {
     width: metadata.width ?? null,
     height: metadata.height ?? null,
@@ -394,9 +332,6 @@ async function deleteManagedImageRecordArtifacts(
   const files = new Set<string>();
   if (record.original?.path) {
     files.add(record.original.path);
-  }
-  if (record.thumbnail?.path) {
-    files.add(record.thumbnail.path);
   }
   let deletedFileCount = 0;
   for (const filePath of files) {
@@ -420,10 +355,7 @@ async function deleteOrphanManagedImageFiles(params: {
   referencedPaths: ReadonlySet<string>;
 }) {
   let deletedFileCount = 0;
-  for (const dir of [
-    resolveOutgoingOriginalsDir(params.stateDir),
-    resolveOutgoingThumbnailsDir(params.stateDir),
-  ]) {
+  for (const dir of [resolveOutgoingOriginalsDir(params.stateDir)]) {
     let names: string[] = [];
     try {
       names = await fs.readdir(dir);
@@ -463,8 +395,7 @@ export async function cleanupManagedOutgoingImageRecords(params?: {
 }): Promise<CleanupManagedOutgoingImageRecordsResult> {
   const stateDir = params?.stateDir ?? resolveStateDir();
   const nowMs = params?.nowMs ?? Date.now();
-  const transientMaxAgeMs =
-    params?.transientMaxAgeMs ?? DEFAULT_TRANSIENT_OUTGOING_IMAGE_TTL_MS;
+  const transientMaxAgeMs = params?.transientMaxAgeMs ?? DEFAULT_TRANSIENT_OUTGOING_IMAGE_TTL_MS;
   const sessionKeyFilter = params?.sessionKey ?? null;
   const forceDeleteSessionRecords = params?.forceDeleteSessionRecords === true;
   const recordsDir = resolveOutgoingRecordsDir(stateDir);
@@ -502,7 +433,10 @@ export async function cleanupManagedOutgoingImageRecords(params?: {
     }
 
     let shouldDelete = false;
-    if (forceDeleteSessionRecords && (!sessionKeyFilter || record.sessionKey === sessionKeyFilter)) {
+    if (
+      forceDeleteSessionRecords &&
+      (!sessionKeyFilter || record.sessionKey === sessionKeyFilter)
+    ) {
       shouldDelete = true;
     } else if (record.messageId) {
       shouldDelete = !(await recordMatchesTranscriptMessage(record));
@@ -517,9 +451,6 @@ export async function cleanupManagedOutgoingImageRecords(params?: {
     } else {
       if (record.original?.path) {
         referencedPaths.add(record.original.path);
-      }
-      if (record.thumbnail?.path) {
-        referencedPaths.add(record.thumbnail.path);
       }
       retainedCount += 1;
     }
@@ -543,15 +474,15 @@ async function readManagedImageRecord(
 }
 
 function buildManagedImageBlock(record: ManagedImageRecord): ManagedImageBlock {
+  const fullUrl = buildOutgoingVariantUrl(record.sessionKey, record.attachmentId, "full");
   return {
     type: "image",
-    url: buildOutgoingVariantUrl(record.sessionKey, record.attachmentId, "thumb"),
-    openUrl: buildOutgoingVariantUrl(record.sessionKey, record.attachmentId, "full"),
-    downloadUrl: buildOutgoingVariantUrl(record.sessionKey, record.attachmentId, "download"),
+    url: fullUrl,
+    openUrl: fullUrl,
     alt: record.alt,
-    mimeType: record.thumbnail.contentType,
-    width: record.thumbnail.width,
-    height: record.thumbnail.height,
+    mimeType: record.original.contentType,
+    width: record.original.width,
+    height: record.original.height,
   };
 }
 
@@ -576,22 +507,21 @@ function toRecordFilename(filePath: string) {
 }
 
 function asArray(value: string[] | undefined | null) {
-  return Array.isArray(value) ? value.filter((item) => typeof item === "string" && item.trim()) : [];
+  return Array.isArray(value)
+    ? value.filter((item) => typeof item === "string" && item.trim())
+    : [];
 }
 
 function parseManagedOutgoingRoute(value: string) {
   try {
     const parsed = new URL(value, "http://localhost");
-    const match = parsed.pathname.match(
-      /^\/api\/chat\/media\/outgoing\/([^/]+)\/([^/]+)\/(thumb|full|download)$/,
-    );
+    const match = parsed.pathname.match(/^\/api\/chat\/media\/outgoing\/([^/]+)\/([^/]+)\/full$/);
     if (!match) {
       return null;
     }
     return {
       sessionKey: decodeURIComponent(match[1]),
       attachmentId: match[2],
-      variant: match[3] as "thumb" | "full" | "download",
     };
   } catch {
     return null;
@@ -607,7 +537,7 @@ function collectManagedOutgoingAttachmentRefs(
     if (block?.type !== "image") {
       continue;
     }
-    for (const candidate of [block.url, block.openUrl, block.downloadUrl]) {
+    for (const candidate of [block.url, block.openUrl]) {
       if (typeof candidate !== "string") {
         continue;
       }
@@ -726,7 +656,6 @@ export async function createManagedOutgoingImageBlocks(params: {
     }
 
     let savedOriginalPath: string | null = null;
-    let savedThumbnailPath: string | null = null;
     try {
       let resizeWarning: ManagedImageBlock | null = null;
       if (parsedDataUrl.kind === "image-data-url") {
@@ -812,32 +741,6 @@ export async function createManagedOutgoingImageBlocks(params: {
         }
       }
 
-      const thumbnailBuffer = shouldCopyOriginalAsThumbnail({
-        metadata:
-          originalStats.width != null && originalStats.height != null
-            ? { width: originalStats.width, height: originalStats.height }
-            : originalMetadata,
-        limits,
-      })
-        ? originalBuffer
-        : await resizeToJpeg({
-            buffer: originalBuffer,
-            maxWidth: limits.thumbnailMaxWidth,
-            maxHeight: limits.thumbnailMaxHeight,
-            quality: THUMBNAIL_QUALITY,
-            withoutEnlargement: true,
-          });
-      const savedThumbnail = await saveMediaBuffer(
-        thumbnailBuffer,
-        thumbnailBuffer === originalBuffer ? savedOriginal.contentType : "image/jpeg",
-        "outgoing/thumbs",
-        limits.maxBytes,
-        thumbnailBuffer === originalBuffer
-          ? toRecordFilename(savedOriginal.path) ?? `generated-image-${index + 1}`
-          : undefined,
-      );
-      savedThumbnailPath = savedThumbnail.path;
-      const thumbnailStats = await getVariantStats(savedThumbnail.path);
       const record: ManagedImageRecord = {
         attachmentId: randomUUID(),
         sessionKey,
@@ -853,14 +756,6 @@ export async function createManagedOutgoingImageBlocks(params: {
           sizeBytes: originalStats.sizeBytes,
           filename: toRecordFilename(savedOriginal.path),
         },
-        thumbnail: {
-          path: savedThumbnail.path,
-          contentType: savedThumbnail.contentType ?? "image/jpeg",
-          width: thumbnailStats.width,
-          height: thumbnailStats.height,
-          sizeBytes: thumbnailStats.sizeBytes,
-          filename: toRecordFilename(savedThumbnail.path),
-        },
       };
       await writeManagedImageRecord(record, stateDir);
       blocks.push(buildManagedImageBlock(record));
@@ -868,10 +763,9 @@ export async function createManagedOutgoingImageBlocks(params: {
         blocks.push(resizeWarning);
       }
     } catch (error) {
-      await Promise.all([
-        savedOriginalPath ? fs.rm(savedOriginalPath, { force: true }).catch(() => {}) : undefined,
-        savedThumbnailPath ? fs.rm(savedThumbnailPath, { force: true }).catch(() => {}) : undefined,
-      ]);
+      if (savedOriginalPath) {
+        await fs.rm(savedOriginalPath, { force: true }).catch(() => {});
+      }
       throwSanitizedManagedImageAttachmentError(error, alt);
     }
   }
@@ -905,9 +799,7 @@ export async function handleManagedOutgoingImageHttpRequest(
   },
 ): Promise<boolean> {
   const requestUrl = new URL(req.url ?? "/", "http://localhost");
-  const match = requestUrl.pathname.match(
-    /^\/api\/chat\/media\/outgoing\/([^/]+)\/([^/]+)\/(thumb|full|download)$/,
-  );
+  const match = requestUrl.pathname.match(/^\/api\/chat\/media\/outgoing\/([^/]+)\/([^/]+)\/full$/);
   if (!match) {
     return false;
   }
@@ -935,7 +827,6 @@ export async function handleManagedOutgoingImageHttpRequest(
   }
 
   const privilegedAccess =
-    
     requestAuth.trustDeclaredOperatorScopes || requestAuth.authMethod === "device-token";
 
   const requestedScopes = resolveOpenAiCompatibleHttpOperatorScopes(req, requestAuth);
@@ -953,8 +844,7 @@ export async function handleManagedOutgoingImageHttpRequest(
 
   const encodedSessionKey = match[1];
   const attachmentId = match[2];
-  const variant = match[3];
-  if (!encodedSessionKey || !attachmentId || !variant) {
+  if (!encodedSessionKey || !attachmentId) {
     return false;
   }
   const sessionKey = decodeURIComponent(encodedSessionKey);
@@ -995,23 +885,21 @@ export async function handleManagedOutgoingImageHttpRequest(
     return true;
   }
 
-  const selected = variant === "thumb" ? record.thumbnail : record.original;
   let body: Buffer;
   try {
-    body = await fs.readFile(selected.path);
+    body = await fs.readFile(record.original.path);
   } catch {
     sendStatus(res, 404, "not found");
     return true;
   }
 
   res.statusCode = 200;
-  res.setHeader("content-type", selected.contentType || "application/octet-stream");
+  res.setHeader("content-type", record.original.contentType || "application/octet-stream");
   res.setHeader("content-length", String(body.byteLength));
   res.setHeader("cache-control", "private, max-age=31536000, immutable");
-  const dispositionType = variant === "download" ? "attachment" : "inline";
   res.setHeader(
     "content-disposition",
-    `${dispositionType}; filename="${safeAttachmentFilename(selected.filename)}"`,
+    `inline; filename="${safeAttachmentFilename(record.original.filename)}"`,
   );
   res.end(body);
   return true;
