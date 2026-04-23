@@ -1,16 +1,27 @@
-import fs from "node:fs/promises";
-import os from "node:os";
-import path from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import type { RestartSentinelPayload } from "../infra/restart-sentinel.js";
 import { withEnvAsync } from "../test-utils/env.js";
 import "./test-helpers/fast-core-tools.js";
 import { createGatewayTool } from "./tools/gateway-tool.js";
 import { callGatewayTool } from "./tools/gateway.js";
 
-const { callGatewayToolMock, readGatewayCallOptionsMock } = vi.hoisted(() => ({
-  callGatewayToolMock: vi.fn(),
-  readGatewayCallOptionsMock: vi.fn(() => ({})),
-}));
+const { callGatewayToolMock, readGatewayCallOptionsMock, writeRestartSentinelMock } = vi.hoisted(
+  () => ({
+    callGatewayToolMock: vi.fn(),
+    readGatewayCallOptionsMock: vi.fn(() => ({})),
+    writeRestartSentinelMock: vi.fn(async (_payload: RestartSentinelPayload) => "/tmp/restart"),
+  }),
+);
+
+vi.mock("../infra/restart-sentinel.js", async () => {
+  const actual = await vi.importActual<typeof import("../infra/restart-sentinel.js")>(
+    "../infra/restart-sentinel.js",
+  );
+  return {
+    ...actual,
+    writeRestartSentinel: writeRestartSentinelMock,
+  };
+});
 
 vi.mock("./tools/gateway.js", () => ({
   callGatewayTool: callGatewayToolMock,
@@ -50,6 +61,7 @@ describe("gateway tool", () => {
   beforeEach(() => {
     callGatewayToolMock.mockClear();
     readGatewayCallOptionsMock.mockClear();
+    writeRestartSentinelMock.mockClear();
     callGatewayToolMock.mockImplementation(async (method: string) => {
       if (method === "config.get") {
         return {
@@ -97,44 +109,36 @@ describe("gateway tool", () => {
   it("schedules SIGUSR1 restart", async () => {
     vi.useFakeTimers();
     const kill = vi.spyOn(process, "kill").mockImplementation(() => true);
-    const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-test-"));
 
     try {
-      await withEnvAsync(
-        { OPENCLAW_STATE_DIR: stateDir, OPENCLAW_PROFILE: "isolated" },
-        async () => {
-          const tool = requireGatewayTool();
+      await withEnvAsync({ OPENCLAW_PROFILE: "isolated" }, async () => {
+        const tool = requireGatewayTool();
 
-          const result = await tool.execute("call1", {
-            action: "restart",
-            delayMs: 0,
-          });
-          expect(result.details).toMatchObject({
-            ok: true,
-            pid: process.pid,
-            signal: "SIGUSR1",
-            delayMs: 0,
-          });
+        const result = await tool.execute("call1", {
+          action: "restart",
+          delayMs: 0,
+        });
+        expect(result.details).toMatchObject({
+          ok: true,
+          pid: process.pid,
+          signal: "SIGUSR1",
+          delayMs: 0,
+        });
 
-          const sentinelPath = path.join(stateDir, "restart-sentinel.json");
-          const raw = await fs.readFile(sentinelPath, "utf-8");
-          const parsed = JSON.parse(raw) as {
-            payload?: { kind?: string; doctorHint?: string | null };
-          };
-          expect(parsed.payload?.kind).toBe("restart");
-          expect(parsed.payload?.doctorHint).toBe(
-            "Run: openclaw --profile isolated doctor --non-interactive",
-          );
+        expect(writeRestartSentinelMock).toHaveBeenCalledWith(
+          expect.objectContaining({
+            kind: "restart",
+            doctorHint: "Run: openclaw --profile isolated doctor --non-interactive",
+          }),
+        );
 
-          expect(kill).not.toHaveBeenCalled();
-          await vi.runAllTimersAsync();
-          expect(kill).toHaveBeenCalledWith(process.pid, "SIGUSR1");
-        },
-      );
+        expect(kill).not.toHaveBeenCalled();
+        await vi.runAllTimersAsync();
+        expect(kill).toHaveBeenCalledWith(process.pid, "SIGUSR1");
+      });
     } finally {
       kill.mockRestore();
       vi.useRealTimers();
-      await fs.rm(stateDir, { recursive: true, force: true });
     }
   });
 
