@@ -113,6 +113,10 @@ type RenderableImageBlock = ImageBlock & {
   displayUrl: string;
 };
 
+type ImageActionOptions = ImageRenderOptions & {
+  label?: string;
+};
+
 type AttachmentItem = Extract<MessageContentItem, { type: "attachment" }>;
 
 const managedImageBlobUrlCache = new Map<string, Promise<string | null>>();
@@ -730,19 +734,15 @@ function renderMessageImages(images: RenderableImageBlock[], opts?: ImageRenderO
     return nothing;
   }
 
-  const openImage = (url: string) => {
-    openExternalUrlSafe(url, { allowDataImage: true });
-  };
-
   const renderImageElement = (img: RenderableImageBlock, previewUrl: string) => html`
-    <img
-      src=${previewUrl}
-      alt=${img.alt ?? "Attached image"}
-      class="chat-message-image"
-      width=${img.width ?? nothing}
-      height=${img.height ?? nothing}
-      @click=${() => openImage(previewUrl)}
-    />
+    ${renderImageFrame({
+      previewUrl,
+      actionUrl: img.displayUrl,
+      alt: img.alt ?? "Attached image",
+      width: img.width,
+      height: img.height,
+      actionOptions: { ...opts, label: img.alt },
+    })}
   `;
 
   const renderImage = (img: RenderableImageBlock) => {
@@ -974,6 +974,196 @@ async function resolveManagedOutgoingImageBlobUrl(
   return pending;
 }
 
+function buildManagedOutgoingImageHeaders(source: string, authToken?: string | null): Headers {
+  const headers = new Headers({ Accept: "image/*" });
+  const normalizedAuthToken = authToken?.trim();
+  if (normalizedAuthToken) {
+    headers.set("Authorization", `Bearer ${normalizedAuthToken}`);
+  }
+  const requesterSessionKey = resolveManagedOutgoingImageRequesterSessionKey(source);
+  if (requesterSessionKey) {
+    headers.set("x-openclaw-requester-session-key", requesterSessionKey);
+  }
+  return headers;
+}
+
+async function fetchImageBlobForAction(source: string, opts?: ImageActionOptions): Promise<Blob> {
+  const isManagedImage = isManagedOutgoingImageSource(source);
+  const fetchUrl = isManagedImage
+    ? buildManagedOutgoingImageFetchUrl(source, opts?.basePath)
+    : source;
+  const res = await fetch(fetchUrl, {
+    method: "GET",
+    headers: isManagedImage
+      ? buildManagedOutgoingImageHeaders(source, opts?.authToken)
+      : new Headers({ Accept: "image/*" }),
+    credentials: "same-origin",
+  });
+  if (!res.ok) {
+    throw new Error(`Image request failed with HTTP ${res.status}`);
+  }
+  const blob = await res.blob();
+  if (!blob.type.startsWith("image/")) {
+    throw new Error(`Expected image response, got ${blob.type || "unknown content type"}`);
+  }
+  return blob;
+}
+
+function imageExtensionForMimeType(mimeType: string): string {
+  switch (mimeType.toLowerCase()) {
+    case "image/jpeg":
+      return "jpg";
+    case "image/webp":
+      return "webp";
+    case "image/gif":
+      return "gif";
+    case "image/avif":
+      return "avif";
+    case "image/png":
+    default:
+      return "png";
+  }
+}
+
+function imageDownloadFileName(label: string | undefined, source: string, blob: Blob): string {
+  const rawName = (label?.trim() || labelForMediaPath(source) || "image").replace(
+    /[<>:"/\\|?*\x00-\x1f]/g,
+    "_",
+  );
+  const stem = rawName.replace(/\.[a-z0-9]{2,5}$/i, "") || "image";
+  return `${stem}.${imageExtensionForMimeType(blob.type || "image/png")}`;
+}
+
+function downloadBlob(blob: Blob, fileName: string) {
+  const blobUrl = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = blobUrl;
+  anchor.download = fileName;
+  anchor.rel = "noreferrer";
+  anchor.style.display = "none";
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  window.setTimeout(() => URL.revokeObjectURL(blobUrl), 30_000);
+}
+
+async function convertImageBlobToPng(blob: Blob): Promise<Blob> {
+  if (blob.type === "image/png" || typeof createImageBitmap !== "function") {
+    return blob;
+  }
+  const bitmap = await createImageBitmap(blob);
+  try {
+    const canvas = document.createElement("canvas");
+    canvas.width = bitmap.width;
+    canvas.height = bitmap.height;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) {
+      return blob;
+    }
+    ctx.drawImage(bitmap, 0, 0);
+    return await new Promise<Blob>((resolve, reject) => {
+      canvas.toBlob((pngBlob) => {
+        if (pngBlob) {
+          resolve(pngBlob);
+        } else {
+          reject(new Error("Could not convert image for clipboard"));
+        }
+      }, "image/png");
+    });
+  } finally {
+    bitmap.close();
+  }
+}
+
+async function downloadImageAction(source: string, opts?: ImageActionOptions) {
+  try {
+    const blob = await fetchImageBlobForAction(source, opts);
+    downloadBlob(blob, imageDownloadFileName(opts?.label, source, blob));
+  } catch (err) {
+    console.warn("Could not download image", err);
+    openExternalUrlSafe(source, { allowDataImage: true });
+  }
+}
+
+async function copyImageAction(source: string, opts?: ImageActionOptions) {
+  try {
+    if (!navigator.clipboard?.write || typeof ClipboardItem === "undefined") {
+      throw new Error("Image clipboard writes are not available");
+    }
+    const blob = await convertImageBlobToPng(await fetchImageBlobForAction(source, opts));
+    const clipboardType = blob.type || "image/png";
+    await navigator.clipboard.write([new ClipboardItem({ [clipboardType]: blob })]);
+  } catch (err) {
+    console.warn("Could not copy image", err);
+  }
+}
+
+function renderImageActions(params: {
+  openUrl: string;
+  actionUrl: string;
+  actionOptions?: ImageActionOptions;
+}) {
+  const stop = (evt: Event) => evt.stopPropagation();
+  return html`
+    <div class="chat-image-actions" @click=${stop}>
+      <button
+        type="button"
+        class="chat-image-action"
+        title="Open image"
+        aria-label="Open image"
+        @click=${() => openExternalUrlSafe(params.openUrl, { allowDataImage: true })}
+      >
+        ${icons.externalLink}
+      </button>
+      <button
+        type="button"
+        class="chat-image-action"
+        title="Download image"
+        aria-label="Download image"
+        @click=${() => downloadImageAction(params.actionUrl, params.actionOptions)}
+      >
+        ${icons.download}
+      </button>
+      <button
+        type="button"
+        class="chat-image-action"
+        title="Copy image"
+        aria-label="Copy image"
+        @click=${() => copyImageAction(params.actionUrl, params.actionOptions)}
+      >
+        ${icons.copy}
+      </button>
+    </div>
+  `;
+}
+
+function renderImageFrame(params: {
+  previewUrl: string;
+  actionUrl: string;
+  alt: string;
+  width?: number;
+  height?: number;
+  actionOptions?: ImageActionOptions;
+}) {
+  return html`
+    <span class="chat-image-frame">
+      <img
+        src=${params.previewUrl}
+        alt=${params.alt}
+        class="chat-message-image"
+        width=${params.width ?? nothing}
+        height=${params.height ?? nothing}
+        @click=${() => openExternalUrlSafe(params.previewUrl, { allowDataImage: true })}
+      />
+      ${renderImageActions({
+        openUrl: params.previewUrl,
+        actionUrl: params.actionUrl,
+        actionOptions: params.actionOptions,
+      })}
+    </span>
+  `;
+}
+
 function buildAssistantAttachmentMetaUrl(
   source: string,
   basePath?: string,
@@ -1108,14 +1298,12 @@ function renderAssistantAttachments(
               reason: availability.status === "unavailable" ? availability.reason : undefined,
             });
           }
-          return html`
-            <img
-              src=${attachmentUrl}
-              alt=${attachment.label}
-              class="chat-message-image"
-              @click=${() => openExternalUrlSafe(attachmentUrl, { allowDataImage: true })}
-            />
-          `;
+          return renderImageFrame({
+            previewUrl: attachmentUrl,
+            actionUrl: attachmentUrl,
+            alt: attachment.label,
+            actionOptions: { basePath, authToken, localMediaPreviewRoots, label: attachment.label },
+          });
         }
         if (attachment.kind === "audio") {
           return html`

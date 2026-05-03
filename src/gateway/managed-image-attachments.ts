@@ -998,6 +998,39 @@ export async function handleManagedOutgoingImageHttpRequest(
     return true;
   }
 
+  const encodedSessionKey = match[1];
+  const attachmentId = match[2];
+  if (!encodedSessionKey || !attachmentId) {
+    return false;
+  }
+  if (!MANAGED_OUTGOING_ATTACHMENT_ID_RE.test(attachmentId)) {
+    sendStatus(res, 404, "not found");
+    return true;
+  }
+  let sessionKey: string;
+  try {
+    sessionKey = decodeURIComponent(encodedSessionKey);
+  } catch {
+    sendStatus(res, 404, "not found");
+    return true;
+  }
+  const record = await readManagedImageRecord(attachmentId, opts.stateDir);
+  if (!record || record.sessionKey !== sessionKey) {
+    sendStatus(res, 404, "not found");
+    return true;
+  }
+
+  const requesterSessionKey = resolveRequesterSessionKey(req);
+  if (requesterSessionKey) {
+    const ownsSession = await requesterOwnsManagedImageSession({
+      requesterSessionKey,
+      targetSessionKey: record.sessionKey,
+    });
+    if (ownsSession) {
+      return await serveManagedOutgoingImageRecord(res, record);
+    }
+  }
+
   const requestAuth = await authorizeGatewayHttpRequestOrReply({
     req,
     res,
@@ -1026,29 +1059,7 @@ export async function handleManagedOutgoingImageHttpRequest(
     return true;
   }
 
-  const encodedSessionKey = match[1];
-  const attachmentId = match[2];
-  if (!encodedSessionKey || !attachmentId) {
-    return false;
-  }
-  if (!MANAGED_OUTGOING_ATTACHMENT_ID_RE.test(attachmentId)) {
-    sendStatus(res, 404, "not found");
-    return true;
-  }
-  let sessionKey: string;
-  try {
-    sessionKey = decodeURIComponent(encodedSessionKey);
-  } catch {
-    sendStatus(res, 404, "not found");
-    return true;
-  }
-  const record = await readManagedImageRecord(attachmentId, opts.stateDir);
-  if (!record || record.sessionKey !== sessionKey) {
-    sendStatus(res, 404, "not found");
-    return true;
-  }
   if (!privilegedAccess) {
-    const requesterSessionKey = resolveRequesterSessionKey(req);
     if (!requesterSessionKey) {
       sendJson(res, 403, {
         ok: false,
@@ -1074,6 +1085,10 @@ export async function handleManagedOutgoingImageHttpRequest(
       return true;
     }
   }
+  return await serveManagedOutgoingImageRecord(res, record);
+}
+
+async function serveManagedOutgoingImageRecord(res: ServerResponse, record: ManagedImageRecord) {
   if (!(await recordMatchesTranscriptMessage(record))) {
     sendStatus(res, 404, "not found");
     return true;

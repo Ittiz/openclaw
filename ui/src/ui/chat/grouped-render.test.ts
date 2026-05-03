@@ -798,6 +798,11 @@ describe("grouped chat rendering", () => {
       "Replying to current message",
     );
     expect(container.querySelector(".chat-message-image")).not.toBeNull();
+    expect(
+      [...container.querySelectorAll<HTMLButtonElement>(".chat-image-action")].map((button) =>
+        button.getAttribute("aria-label"),
+      ),
+    ).toEqual(["Open image", "Download image", "Copy image"]);
     expect(container.querySelector("audio")).not.toBeNull();
     expect(container.querySelector(".chat-assistant-attachment-badge")?.textContent).toContain(
       "Voice note",
@@ -1108,6 +1113,7 @@ describe("grouped chat rendering", () => {
     const docLink = container.querySelector<HTMLAnchorElement>(
       ".chat-assistant-attachment-card__link",
     );
+    expect(container.querySelector(".chat-image-actions")).not.toBeNull();
     expect(image?.getAttribute("src")).toBe(
       "/openclaw/__openclaw__/assistant-media?source=%2Ftmp%2Fopenclaw%2Ftest+image.png&token=session-token",
     );
