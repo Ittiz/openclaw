@@ -22306,6 +22306,14 @@ export const GENERATED_BASE_CONFIG_SCHEMA: BaseConfigSchemaResponse = {
                 description:
                   'Optional CSS max-width for grouped Control UI chat messages, for example "960px", "82%", or "min(1280px, 82%)". Values are validated against a constrained width grammar before reaching the browser.',
               },
+              imageThumbnailMaxSide: {
+                type: "integer",
+                minimum: 32,
+                maximum: 4096,
+                title: "Control UI Image Thumbnail Max Side",
+                description:
+                  "Maximum width or height, in pixels, for server-generated inline image thumbnails in the Control UI chat timeline (default 300). Download and copy actions still use the original full-size image.",
+              },
               allowedOrigins: {
                 type: "array",
                 items: {
@@ -25984,6 +25992,11 @@ export const GENERATED_BASE_CONFIG_SCHEMA: BaseConfigSchemaResponse = {
     "gateway.controlUi.chatMessageMaxWidth": {
       label: "Control UI Chat Message Max Width",
       help: 'Optional CSS max-width for grouped Control UI chat messages, for example "960px", "82%", or "min(1280px, 82%)". Values are validated against a constrained width grammar before reaching the browser.',
+      tags: ["advanced"],
+    },
+    "gateway.controlUi.imageThumbnailMaxSide": {
+      label: "Control UI Image Thumbnail Max Side",
+      help: "Maximum width or height, in pixels, for server-generated inline image thumbnails in the Control UI chat timeline (default 300). Download and copy actions still use the original full-size image.",
       tags: ["advanced"],
     },
     "gateway.controlUi.allowedOrigins": {

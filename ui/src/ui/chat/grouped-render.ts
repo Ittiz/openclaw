@@ -1,4 +1,5 @@
 import { html, nothing } from "lit";
+import { styleMap } from "lit/directives/style-map.js";
 import { unsafeHTML } from "lit/directives/unsafe-html.js";
 import { until } from "lit/directives/until.js";
 import { getSafeLocalStorage } from "../../local-storage.ts";
@@ -111,6 +112,7 @@ type ImageRenderOptions = {
 
 type RenderableImageBlock = ImageBlock & {
   displayUrl: string;
+  previewUrl?: string;
 };
 
 type ImageActionOptions = ImageRenderOptions & {
@@ -118,6 +120,9 @@ type ImageActionOptions = ImageRenderOptions & {
 };
 
 type AttachmentItem = Extract<MessageContentItem, { type: "attachment" }>;
+
+const CHAT_IMAGE_MAX_WIDTH = 300;
+const CHAT_IMAGE_MAX_HEIGHT = 200;
 
 const managedImageBlobUrlCache = new Map<string, Promise<string | null>>();
 const managedImageBlobUrlResolvedCache = new Map<string, string>();
@@ -725,7 +730,10 @@ function resolveRenderableMessageImages(
     const displayUrl = canProxyLocalImage
       ? buildAssistantAttachmentUrl(img.url, opts?.basePath, opts?.authToken)
       : img.url;
-    return [{ ...img, displayUrl }];
+    const previewUrl = canProxyLocalImage
+      ? buildAssistantAttachmentUrl(img.url, opts?.basePath, opts?.authToken, { thumbnail: true })
+      : displayUrl;
+    return [{ ...img, displayUrl, previewUrl }];
   });
 }
 
@@ -737,6 +745,7 @@ function renderMessageImages(images: RenderableImageBlock[], opts?: ImageRenderO
   const renderImageElement = (img: RenderableImageBlock, previewUrl: string) => html`
     ${renderImageFrame({
       previewUrl,
+      openUrl: img.displayUrl,
       actionUrl: img.displayUrl,
       alt: img.alt ?? "Attached image",
       width: img.width,
@@ -747,7 +756,7 @@ function renderMessageImages(images: RenderableImageBlock[], opts?: ImageRenderO
 
   const renderImage = (img: RenderableImageBlock) => {
     if (!isManagedOutgoingImageSource(img.displayUrl)) {
-      return renderImageElement(img, img.displayUrl);
+      return renderImageElement(img, img.previewUrl ?? img.displayUrl);
     }
     const preview = resolveManagedOutgoingImageBlobUrl(img.displayUrl, opts).then((previewUrl) => {
       if (!previewUrl) {
@@ -755,7 +764,7 @@ function renderMessageImages(images: RenderableImageBlock[], opts?: ImageRenderO
       }
       return renderImageElement(img, previewUrl);
     });
-    return until(preview, nothing);
+    return until(preview, renderImagePlaceholderFrame(img));
   };
 
   return html` <div class="chat-message-images">${images.map((img) => renderImage(img))}</div> `;
@@ -872,6 +881,7 @@ function buildAssistantAttachmentUrl(
   source: string,
   basePath?: string,
   authToken?: string | null,
+  opts?: { thumbnail?: boolean },
 ): string {
   if (!isLocalAssistantAttachmentSource(source)) {
     return source;
@@ -882,6 +892,9 @@ function buildAssistantAttachmentUrl(
   const normalizedToken = authToken?.trim();
   if (normalizedToken) {
     params.set("token", normalizedToken);
+  }
+  if (opts?.thumbnail) {
+    params.set("thumbnail", "1");
   }
   return `${normalizedBasePath}/__openclaw__/assistant-media?${params.toString()}`;
 }
@@ -922,12 +935,23 @@ function buildManagedOutgoingImageFetchUrl(source: string, basePath?: string): s
   return `${normalizedBasePath}${source}`;
 }
 
+function buildManagedOutgoingImagePreviewFetchUrl(source: string, basePath?: string): string {
+  const fetchUrl = buildManagedOutgoingImageFetchUrl(source, basePath);
+  try {
+    const parsed = new URL(fetchUrl, window.location.origin);
+    parsed.pathname = parsed.pathname.replace(/\/full$/u, "/thumbnail");
+    return fetchUrl.startsWith("http") ? parsed.toString() : `${parsed.pathname}${parsed.search}`;
+  } catch {
+    return fetchUrl.replace(/\/full(?=$|\?)/u, "/thumbnail");
+  }
+}
+
 async function resolveManagedOutgoingImageBlobUrl(
   source: string,
   opts?: ImageRenderOptions,
 ): Promise<string | null> {
   const authToken = opts?.authToken?.trim() ?? "";
-  const fetchUrl = buildManagedOutgoingImageFetchUrl(source, opts?.basePath);
+  const fetchUrl = buildManagedOutgoingImagePreviewFetchUrl(source, opts?.basePath);
   const cacheKey = `${fetchUrl}::${authToken}`;
   const cached = managedImageBlobUrlResolvedCache.get(cacheKey);
   if (cached) {
@@ -1026,12 +1050,18 @@ function imageExtensionForMimeType(mimeType: string): string {
 }
 
 function imageDownloadFileName(label: string | undefined, source: string, blob: Blob): string {
-  const rawName = (label?.trim() || labelForMediaPath(source) || "image").replace(
-    /[<>:"/\\|?*\x00-\x1f]/g,
-    "_",
-  );
+  const rawName = sanitizeImageFileName(label?.trim() || labelForMediaPath(source) || "image");
   const stem = rawName.replace(/\.[a-z0-9]{2,5}$/i, "") || "image";
   return `${stem}.${imageExtensionForMimeType(blob.type || "image/png")}`;
+}
+
+function sanitizeImageFileName(value: string): string {
+  const invalid = new Set(["<", ">", ":", '"', "/", "\\", "|", "?", "*"]);
+  let output = "";
+  for (const char of value) {
+    output += char.charCodeAt(0) < 32 || invalid.has(char) ? "_" : char;
+  }
+  return output;
 }
 
 function downloadBlob(blob: Blob, fileName: string) {
@@ -1139,29 +1169,73 @@ function renderImageActions(params: {
 
 function renderImageFrame(params: {
   previewUrl: string;
+  openUrl: string;
   actionUrl: string;
   alt: string;
   width?: number;
   height?: number;
   actionOptions?: ImageActionOptions;
 }) {
+  const displaySize = resolveChatImageDisplaySize(params.width, params.height);
   return html`
-    <span class="chat-image-frame">
+    <span
+      class="chat-image-frame ${displaySize ? "chat-image-frame--sized" : ""}"
+      style=${renderChatImageFrameStyle(displaySize)}
+    >
       <img
         src=${params.previewUrl}
         alt=${params.alt}
         class="chat-message-image"
-        width=${params.width ?? nothing}
-        height=${params.height ?? nothing}
-        @click=${() => openExternalUrlSafe(params.previewUrl, { allowDataImage: true })}
+        width=${displaySize?.width ?? nothing}
+        height=${displaySize?.height ?? nothing}
+        @click=${() => openExternalUrlSafe(params.openUrl, { allowDataImage: true })}
       />
       ${renderImageActions({
-        openUrl: params.previewUrl,
+        openUrl: params.openUrl,
         actionUrl: params.actionUrl,
         actionOptions: params.actionOptions,
       })}
     </span>
   `;
+}
+
+function renderImagePlaceholderFrame(img: RenderableImageBlock) {
+  const displaySize = resolveChatImageDisplaySize(img.width, img.height);
+  if (!displaySize) {
+    return nothing;
+  }
+  return html`
+    <span
+      class="chat-image-frame chat-image-frame--sized chat-image-frame--pending"
+      aria-label=${img.alt ?? "Loading image"}
+      role="img"
+      style=${renderChatImageFrameStyle(displaySize)}
+    ></span>
+  `;
+}
+
+function renderChatImageFrameStyle(displaySize: { width: number; height: number } | null) {
+  if (!displaySize) {
+    return nothing;
+  }
+  return styleMap({
+    "--chat-image-frame-width": `${displaySize.width}px`,
+    "--chat-image-frame-aspect": `${displaySize.width} / ${displaySize.height}`,
+  });
+}
+
+function resolveChatImageDisplaySize(
+  width: number | undefined,
+  height: number | undefined,
+): { width: number; height: number } | null {
+  if (!Number.isFinite(width) || !Number.isFinite(height) || !width || !height) {
+    return null;
+  }
+  const scale = Math.min(1, CHAT_IMAGE_MAX_WIDTH / width, CHAT_IMAGE_MAX_HEIGHT / height);
+  return {
+    width: Math.max(1, Math.round(width * scale)),
+    height: Math.max(1, Math.round(height * scale)),
+  };
 }
 
 function buildAssistantAttachmentMetaUrl(
@@ -1299,7 +1373,10 @@ function renderAssistantAttachments(
             });
           }
           return renderImageFrame({
-            previewUrl: attachmentUrl,
+            previewUrl: buildAssistantAttachmentUrl(attachment.url, basePath, authToken, {
+              thumbnail: true,
+            }),
+            openUrl: attachmentUrl,
             actionUrl: attachmentUrl,
             alt: attachment.label,
             actionOptions: { basePath, authToken, localMediaPreviewRoots, label: attachment.label },
