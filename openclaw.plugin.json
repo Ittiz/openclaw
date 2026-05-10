@@ -1,0 +1,13 @@
+{
+  "id": "session-search",
+  "name": "Session Search",
+  "description": "Search, inspect, inject, and resume prior OpenClaw sessions from the Control UI.",
+  "activation": {
+    "onStartup": true
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
+}
