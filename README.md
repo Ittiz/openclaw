@@ -4,6 +4,8 @@ Session Search is an OpenClaw Control UI plugin for finding, inspecting, injecti
 
 It is intended for OpenClaw builds that support Plugin UI Entry Points, gateway-authenticated plugin HTTP routes, session transcript access, and the `before_prompt_build` plugin hook.
 
+Proven working on OpenClaw `2026.5.7` at `openclaw/openclaw@fe045232118` (validated May 12, 2026). Newer compatible builds should work when they preserve the required host APIs below.
+
 ## Installation
 
 This repository contains only the Session Search plugin files. Install it into a compatible OpenClaw source checkout or extension workspace.
@@ -79,6 +81,8 @@ These injection paths are intentionally transcript-focused:
 - The plugin does not call external services.
 
 ## Compatibility
+
+Proven working on OpenClaw `2026.5.7` at `openclaw/openclaw@fe045232118`.
 
 This plugin is designed as an OpenClaw workspace/bundled extension. It imports OpenClaw plugin runtime helpers and expects a compatible OpenClaw build with:
 
