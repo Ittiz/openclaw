@@ -7,7 +7,6 @@ import { buildBootstrapContextFiles } from "../../../src/agents/pi-embedded-help
 import { resolveSessionStoreEntry } from "../../../src/config/sessions/store-entry.js";
 import { appendSessionTranscriptMessage } from "../../../src/config/sessions/transcript-append.js";
 import type { OpenClawConfig } from "../../../src/config/types.js";
-import { issuePluginUiEntryPointLaunchPath } from "../../../src/gateway/plugin-ui-entry-launch-tokens.js";
 import { emitSessionTranscriptUpdate } from "../../../src/sessions/transcript-events.js";
 import type { OpenClawPluginApi, OpenClawPluginHttpRouteHandler } from "../api.js";
 import { clearSessionSearchInjection, queueSessionSearchInjection } from "./pending-injections.js";
@@ -88,7 +87,6 @@ const RESUME_DAILY_MEMORY_DAYS = 2;
 const RESUME_DAILY_MEMORY_MAX_FILE_BYTES = 64 * 1024;
 const RESUME_DAILY_MEMORY_MAX_CHARS = 5_000;
 const INJECTION_TTL_MS = 10 * 60_000;
-const ACTION_LAUNCH_TTL_MS = 10 * 60_000;
 const PLUGIN_UI_ENTRY_SESSION_KEY_HEADER = "x-openclaw-plugin-ui-session-key";
 const PLUGIN_UI_ENTRY_CONTEXT_TOKENS_HEADER = "x-openclaw-plugin-ui-context-tokens";
 const SHOW_SESSION_ACTION_PATH = "/plugins/session-search/show-session";
@@ -216,13 +214,7 @@ function issueShowSessionActionPath(
   if (!sessionKey) {
     return undefined;
   }
-  return issuePluginUiEntryPointLaunchPath({
-    path: SHOW_SESSION_ACTION_PATH,
-    scopes: ["operator.read"],
-    sessionKey,
-    contextTokens: resolveTargetContextTokens(req),
-    ttlMs: ACTION_LAUNCH_TTL_MS,
-  });
+  return SHOW_SESSION_ACTION_PATH;
 }
 
 function resolveLimit(value: string | null): number {
@@ -1297,6 +1289,54 @@ function renderShell(params: {
           toast.textContent = "";
         }, 3500);
       };
+      let pluginUiBridgePort;
+      let pluginUiBridgeRequestId = 0;
+      const pluginUiBridgeRequests = new Map();
+      window.addEventListener("message", (event) => {
+        if (event.data?.type === "openclaw.pluginUi.connect" && event.ports?.[0]) {
+          pluginUiBridgePort = event.ports[0];
+          pluginUiBridgePort.start();
+          return;
+        }
+        if (event.data?.type !== "openclaw.pluginUi.response") return;
+        const request = pluginUiBridgeRequests.get(event.data.id);
+        if (!request) return;
+        pluginUiBridgeRequests.delete(event.data.id);
+        request.resolve(event.data);
+      });
+      const pluginUiRequest = async (path, init) => {
+        if (!pluginUiBridgePort) {
+          const response = await fetch(path, {
+            ...init,
+            credentials: "include",
+          });
+          return {
+            ok: response.ok,
+            status: response.status,
+            statusText: response.statusText,
+            body: await response.text(),
+          };
+        }
+        const id = "session-search-" + String(++pluginUiBridgeRequestId);
+        return await new Promise((resolve, reject) => {
+          const timer = window.setTimeout(() => {
+            pluginUiBridgeRequests.delete(id);
+            reject(new Error("Plugin request timed out."));
+          }, 15000);
+          pluginUiBridgeRequests.set(id, {
+            resolve: (payload) => {
+              window.clearTimeout(timer);
+              resolve(payload);
+            },
+          });
+          pluginUiBridgePort.postMessage({
+            type: "openclaw.pluginUi.request",
+            id,
+            path,
+            init,
+          });
+        });
+      };
       const updateMessageSelectionBar = () => {
         const selectedCount = messageAgentToggles.filter(
           (button) => button.getAttribute("aria-pressed") === "true",
@@ -1320,44 +1360,24 @@ function renderShell(params: {
         }
         updateMessageSelectionBar();
       };
-      const submitSessionToAgent = (button, sessionKey, options = {}) => {
+      const submitSessionToAgent = async (button, sessionKey, options = {}) => {
         if (!sessionKey) return;
         if (!showSessionActionPath) {
           showToast("Could not inject session.");
           return;
         }
         button.disabled = true;
-        const form = document.createElement("form");
-        form.method = "post";
-        form.action = showSessionActionPath;
-        form.target = "session-search-action-frame";
-        const input = document.createElement("input");
-        input.type = "hidden";
-        input.name = "sessionKey";
-        input.value = sessionKey;
-        form.append(input);
+        const body = new URLSearchParams();
+        body.set("sessionKey", sessionKey);
         if (options.selectedMessageIndexes) {
-          const selectedInput = document.createElement("input");
-          selectedInput.type = "hidden";
-          selectedInput.name = "selectedMessageIndexes";
-          selectedInput.value = JSON.stringify(options.selectedMessageIndexes);
-          form.append(selectedInput);
+          body.set("selectedMessageIndexes", JSON.stringify(options.selectedMessageIndexes));
         }
         if (options.resumeSession) {
-          const resumeInput = document.createElement("input");
-          resumeInput.type = "hidden";
-          resumeInput.name = "resumeSession";
-          resumeInput.value = "true";
-          form.append(resumeInput);
+          body.set("resumeSession", "true");
         }
         if (options.resumeThroughMessageIndex !== undefined) {
-          const resumeThroughInput = document.createElement("input");
-          resumeThroughInput.type = "hidden";
-          resumeThroughInput.name = "resumeThroughMessageIndex";
-          resumeThroughInput.value = String(options.resumeThroughMessageIndex);
-          form.append(resumeThroughInput);
+          body.set("resumeThroughMessageIndex", String(options.resumeThroughMessageIndex));
         }
-        document.body.append(form);
         showToast(
           options.resumeSession
             ? "Resuming session..."
@@ -1365,13 +1385,40 @@ function renderShell(params: {
               ? "Sending selected messages to agent..."
               : "Sending session to agent...",
         );
-        form.submit();
-        form.remove();
-        if (showSessionTimer) window.clearTimeout(showSessionTimer);
-        showSessionTimer = window.setTimeout(() => {
-          button.disabled = false;
+        try {
+          const response = await pluginUiRequest(showSessionActionPath, {
+            method: "POST",
+            headers: {
+              accept: "application/json",
+              "content-type": "application/x-www-form-urlencoded",
+            },
+            body: body.toString(),
+          });
+          let payload;
+          try {
+            payload = JSON.parse(response.body);
+          } catch {
+            payload = {
+              ok: false,
+              message: "Could not inject session.",
+            };
+          }
+          if (payload.nextActionPath) {
+            showSessionActionPath = payload.nextActionPath;
+          }
+          if (payload.ok) {
+            window.parent?.postMessage(
+              { type: "openclaw.pluginUi.navigate", target: "chat", sessionKey: payload.sessionKey },
+              "*",
+            );
+            return;
+          }
+          showToast(payload.message || "Could not inject session.");
+        } catch {
           showToast("Could not inject session.");
-        }, 6000);
+        } finally {
+          button.disabled = false;
+        }
       };
       const applySearch = () => {
         const query = searchInput?.value.trim().toLowerCase() ?? "";
