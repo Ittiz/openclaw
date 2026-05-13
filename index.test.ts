@@ -171,18 +171,108 @@ describe("session-search plugin", () => {
     expect(res.setHeader).toHaveBeenCalledWith("content-type", "text/html; charset=utf-8");
     expect(res.setHeader).toHaveBeenCalledWith("cache-control", "no-store");
     expect(chunks.join("")).toContain("Session Search");
-    expect(chunks.join("")).toContain("Find old deployment notes");
-    expect(chunks.join("")).toContain("Deployment notes found.");
-    expect(chunks.join("")).toContain("Older transcript outside sessions json");
-    expect(chunks.join("")).toContain("Deleted archived transcript still searchable");
-    expect(chunks.join("")).toContain('href="#session-0"');
-    expect(chunks.join("")).toContain('title="Show Session to Agent"');
-    expect(chunks.join("")).toContain('data-show-session-agent data-session-key="main"');
-    expect(chunks.join("")).toContain('title="Resume Session"');
-    expect(chunks.join("")).toContain('data-resume-session data-session-key="main"');
-    expect(chunks.join("")).toContain(">Resume Session</button>");
-    expect(chunks.join("")).toContain('title="Resume Session from Here"');
-    expect(chunks.join("")).toContain('data-resume-session-from-here data-message-index="0"');
+    expect(chunks.join("")).toContain("Loading sessions");
+    chunks.length = 0;
+
+    await route.handler(
+      { method: "GET", url: "/plugins/session-search/api/sessions?limit=10" } as never,
+      res as never,
+    );
+
+    expect(res.statusCode).toBe(200);
+    expect(res.setHeader).toHaveBeenCalledWith("content-type", "application/json; charset=utf-8");
+    const payload = JSON.parse(chunks.join("")) as { items?: Array<Record<string, unknown>> };
+    const serializedItems = JSON.stringify(payload.items);
+    expect(serializedItems).toContain("Find old deployment notes");
+    expect(serializedItems).toContain("Older transcript outside sessions json");
+    expect(serializedItems).toContain("Deleted archived transcript still searchable");
+    expect(serializedItems).not.toContain("/plugins/session-search/session/main");
+    expect(payload.items?.[0]).not.toHaveProperty("detailPath");
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+
+  it("does not cap the default unfiltered session list", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-session-search-test-"));
+    const storePath = path.join(dir, "sessions.json");
+    const sessionStore: Record<string, unknown> = {};
+    for (let index = 0; index < 55; index += 1) {
+      const key = `session-${index}`;
+      const transcriptPath = path.join(dir, `${key}.jsonl`);
+      sessionStore[key] = {
+        sessionId: key,
+        updatedAt: 1_700_000_000_000 + index,
+        sessionFile: transcriptPath,
+        lastChannel: "webchat",
+      };
+      await fs.writeFile(
+        transcriptPath,
+        [
+          JSON.stringify({
+            type: "message",
+            message: { role: "user", content: `Unfiltered session ${index}` },
+          }),
+          "",
+        ].join("\n"),
+      );
+    }
+    await fs.writeFile(storePath, JSON.stringify(sessionStore));
+    const routes: Array<Parameters<OpenClawPluginApi["registerHttpRoute"]>[0]> = [];
+    const api = createTestPluginApi({
+      id: "session-search",
+      name: "Session Search",
+      version: "test",
+      runtime: {
+        config: {
+          current: () => ({ session: { store: storePath } }) as never,
+        },
+        agent: {
+          session: {
+            resolveStorePath: () => storePath,
+            loadSessionStore: () => sessionStore as never,
+            resolveSessionFilePath: (_sessionId, entry) =>
+              (entry as { sessionFile?: string }).sessionFile ?? "",
+          },
+        },
+      } as never,
+      registerHttpRoute(route) {
+        routes.push(route);
+      },
+    });
+    registerSessionSearchPlugin(api);
+    const route = routes[0];
+    if (!route) {
+      throw new Error("expected session-search route registration");
+    }
+    const chunks: string[] = [];
+    const res = {
+      statusCode: 0,
+      setHeader: vi.fn(),
+      end: vi.fn((chunk: string) => {
+        chunks.push(chunk);
+      }),
+    };
+
+    await route.handler({ url: "/plugins/session-search/" } as never, res as never);
+
+    const html = chunks.join("");
+    expect(res.statusCode).toBe(200);
+    expect(html).toContain("Loading sessions");
+    chunks.length = 0;
+
+    await route.handler(
+      { method: "GET", url: "/plugins/session-search/api/sessions?limit=200" } as never,
+      res as never,
+    );
+
+    const payload = JSON.parse(chunks.join("")) as {
+      items?: Array<Record<string, unknown>>;
+      totalCandidates?: number;
+      done?: boolean;
+    };
+    expect(payload.totalCandidates).toBe(55);
+    expect(payload.items).toHaveLength(55);
+    expect(payload.done).toBe(true);
+    expect(JSON.stringify(payload.items)).toContain("Unfiltered session 54");
     await fs.rm(dir, { recursive: true, force: true });
   });
 

@@ -60,6 +60,26 @@ type SessionSummary = {
   searchableText: string;
 };
 
+type SessionSummaryCandidate =
+  | {
+      kind: "store";
+      key: string;
+      entry: SessionEntryLike;
+      sessionId: string;
+      transcriptPath?: string;
+      updatedAt: number;
+      order: number;
+    }
+  | {
+      kind: "transcript";
+      key: string;
+      sessionId: string;
+      status: string;
+      transcriptPath: string;
+      updatedAt: number;
+      order: number;
+    };
+
 type TranscriptMessage = {
   index: number;
   role: string;
@@ -75,7 +95,7 @@ type SessionSearchPageParams = {
 };
 
 const DEFAULT_AGENT_ID = "main";
-const DEFAULT_LIMIT = 50;
+const DEFAULT_BATCH_LIMIT = 25;
 const MAX_LIMIT = 200;
 const MAX_TRANSCRIPT_BYTES_FOR_SEARCH = 512 * 1024;
 const MAX_DETAIL_MESSAGES = 120;
@@ -217,12 +237,24 @@ function issueShowSessionActionPath(
   return SHOW_SESSION_ACTION_PATH;
 }
 
-function resolveLimit(value: string | null): number {
+function resolveLimit(value: string | null): number | undefined {
+  if (value === null) {
+    return undefined;
+  }
   const parsed = Number.parseInt(value ?? "", 10);
   if (!Number.isFinite(parsed) || parsed <= 0) {
-    return DEFAULT_LIMIT;
+    return undefined;
   }
   return Math.min(parsed, MAX_LIMIT);
+}
+
+function resolveBatchLimit(value: string | null): number {
+  return resolveLimit(value) ?? DEFAULT_BATCH_LIMIT;
+}
+
+function resolveOffset(value: string | null): number {
+  const parsed = Number.parseInt(value ?? "", 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
 }
 
 function compactWhitespace(value: string): string {
@@ -274,6 +306,7 @@ function parseTranscriptMessage(line: string): TranscriptMessage | undefined {
     return undefined;
   }
   return {
+    index: 0,
     role,
     ...(finiteNumber(record.timestamp) !== undefined
       ? { timestamp: finiteNumber(record.timestamp) }
@@ -563,10 +596,14 @@ async function appendInjectionMarkerToTargetSession(params: {
   const targetSessionId = stringValue(entry?.sessionId) || resolved.normalizedKey;
   let transcriptPath: string;
   try {
-    transcriptPath = sessionRuntime.resolveSessionFilePath(targetSessionId, entry, {
-      agentId: DEFAULT_AGENT_ID,
-      sessionsDir: path.dirname(params.storePath),
-    });
+    transcriptPath = sessionRuntime.resolveSessionFilePath(
+      targetSessionId,
+      entry as { sessionFile?: string } | undefined,
+      {
+        agentId: DEFAULT_AGENT_ID,
+        sessionsDir: path.dirname(params.storePath),
+      },
+    );
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : String(err) };
   }
@@ -825,101 +862,280 @@ async function loadDiscoveredTranscriptSummaries(params: {
   }
   return summaries;
 }
+void loadDiscoveredTranscriptSummaries;
+
+function resolveSessionStorePath(api: OpenClawPluginApi): string {
+  const cfg = api.runtime.config.current();
+  return api.runtime.agent.session.resolveStorePath(cfg.session?.store, {
+    agentId: DEFAULT_AGENT_ID,
+  });
+}
+
+async function resolveSessionSummaryCandidates(params: {
+  api: OpenClawPluginApi;
+  storePath: string;
+}): Promise<SessionSummaryCandidate[]> {
+  const sessionRuntime = params.api.runtime.agent.session;
+  const sessionsDir = path.dirname(params.storePath);
+  const knownTranscriptPaths = new Set<string>();
+  const store = sessionRuntime.loadSessionStore(params.storePath, { skipCache: true });
+  const candidates: SessionSummaryCandidate[] = [];
+  let order = 0;
+  for (const [key, rawEntry] of Object.entries(store)) {
+    const entry = rawEntry as SessionEntryLike;
+    const sessionId = stringValue(entry.sessionId) || key;
+    let transcriptPath: string | undefined;
+    try {
+      transcriptPath = sessionRuntime.resolveSessionFilePath(
+        sessionId,
+        entry as { sessionFile?: string },
+        {
+          agentId: DEFAULT_AGENT_ID,
+          sessionsDir,
+        },
+      );
+    } catch {
+      transcriptPath = undefined;
+    }
+    if (transcriptPath) {
+      knownTranscriptPaths.add(path.resolve(transcriptPath));
+    }
+    candidates.push({
+      kind: "store",
+      key,
+      entry,
+      sessionId,
+      ...(transcriptPath ? { transcriptPath } : {}),
+      updatedAt: finiteNumber(entry.updatedAt) ?? 0,
+      order,
+    });
+    order += 1;
+  }
+  let files: string[];
+  try {
+    files = await fs.readdir(sessionsDir);
+  } catch {
+    files = [];
+  }
+  for (const fileName of files) {
+    const parsedFile = parseSearchableTranscriptFileName(fileName);
+    if (!parsedFile) {
+      continue;
+    }
+    const transcriptPath = path.join(sessionsDir, fileName);
+    const resolvedPath = path.resolve(transcriptPath);
+    if (knownTranscriptPaths.has(resolvedPath)) {
+      continue;
+    }
+    let updatedAt = 0;
+    try {
+      updatedAt = (await fs.stat(transcriptPath)).mtimeMs;
+    } catch {
+      continue;
+    }
+    const sessionId = parsedFile.sessionId;
+    candidates.push({
+      kind: "transcript",
+      key: `agent:${DEFAULT_AGENT_ID}:${sessionId}`,
+      sessionId,
+      status: parsedFile.status,
+      transcriptPath,
+      updatedAt,
+      order,
+    });
+    order += 1;
+  }
+  candidates.sort((a, b) => b.updatedAt - a.updatedAt || a.order - b.order);
+  return candidates;
+}
+
+async function summarizeSessionCandidate(
+  candidate: SessionSummaryCandidate,
+): Promise<SessionSummary> {
+  if (candidate.kind === "transcript") {
+    const messages = await readTranscriptMessages(candidate.transcriptPath, {
+      maxBytes: MAX_TRANSCRIPT_BYTES_FOR_SEARCH,
+    });
+    const title = titleForSession(candidate.key, { sessionId: candidate.sessionId }, messages);
+    const channel = "transcript";
+    const model = "unknown";
+    const startedAt = messages.find((message) => message.timestamp !== undefined)?.timestamp;
+    return {
+      key: candidate.key,
+      sessionId: candidate.sessionId,
+      updatedAt: candidate.updatedAt,
+      ...(startedAt !== undefined ? { startedAt } : {}),
+      title,
+      channel,
+      status: candidate.status,
+      model,
+      transcriptPath: candidate.transcriptPath,
+      excerpt: truncate(messages.at(-1)?.text ?? "", 220),
+      searchableText: createSearchableText({
+        key: candidate.key,
+        sessionId: candidate.sessionId,
+        title,
+        channel,
+        status: candidate.status,
+        model,
+        messages,
+      }),
+    };
+  }
+  const messages = await readTranscriptMessages(candidate.transcriptPath, {
+    maxBytes: MAX_TRANSCRIPT_BYTES_FOR_SEARCH,
+  });
+  const entry = candidate.entry;
+  const excerpt = truncate(messages.at(-1)?.text ?? "", 220);
+  const title = titleForSession(candidate.key, entry, messages);
+  const channel = channelForSession(entry);
+  const status = stringValue(entry.status) || "active";
+  const model = modelForSession(entry);
+  const searchableText = createSearchableText({
+    key: candidate.key,
+    sessionId: candidate.sessionId,
+    title,
+    channel,
+    status,
+    model,
+    entry,
+    messages,
+  });
+  const summary: SessionSummary = {
+    key: candidate.key,
+    sessionId: candidate.sessionId,
+    updatedAt: candidate.updatedAt,
+    title,
+    channel,
+    status,
+    model,
+    excerpt,
+    searchableText,
+  };
+  const startedAt = finiteNumber(entry.sessionStartedAt) ?? finiteNumber(entry.startedAt);
+  if (startedAt !== undefined) {
+    summary.startedAt = startedAt;
+  }
+  const endedAt = finiteNumber(entry.endedAt);
+  if (endedAt !== undefined) {
+    summary.endedAt = endedAt;
+  }
+  const parentSessionKey = stringValue(entry.parentSessionKey);
+  if (parentSessionKey) {
+    summary.parentSessionKey = parentSessionKey;
+  }
+  const origin = {
+    label: stringValue(entry.origin?.label),
+    provider: stringValue(entry.origin?.provider),
+    surface: stringValue(entry.origin?.surface),
+    from: stringValue(entry.origin?.from),
+    to: stringValue(entry.origin?.to),
+  };
+  if (Object.values(origin).some(Boolean)) {
+    summary.origin = Object.fromEntries(
+      Object.entries(origin).filter((entry): entry is [string, string] => Boolean(entry[1])),
+    );
+  }
+  if (candidate.transcriptPath) {
+    summary.transcriptPath = candidate.transcriptPath;
+  }
+  return summary;
+}
 
 async function loadSessionSummaries(api: OpenClawPluginApi): Promise<{
   storePath: string;
   sessions: SessionSummary[];
 }> {
-  const cfg = api.runtime.config.current();
-  const sessionRuntime = api.runtime.agent.session;
-  const storePath = sessionRuntime.resolveStorePath(cfg.session?.store, {
-    agentId: DEFAULT_AGENT_ID,
-  });
-  const sessionsDir = path.dirname(storePath);
-  const knownTranscriptPaths = new Set<string>();
-  const store = sessionRuntime.loadSessionStore(storePath, { skipCache: true });
+  const storePath = resolveSessionStorePath(api);
+  const candidates = await resolveSessionSummaryCandidates({ api, storePath });
   const sessions = await Promise.all(
-    Object.entries(store).map(async ([key, rawEntry]) => {
-      const entry = rawEntry as SessionEntryLike;
-      const sessionId = stringValue(entry.sessionId) || key;
-      let transcriptPath: string | undefined;
-      try {
-        transcriptPath = sessionRuntime.resolveSessionFilePath(sessionId, entry, {
-          agentId: DEFAULT_AGENT_ID,
-          sessionsDir: path.dirname(storePath),
-        });
-      } catch {
-        transcriptPath = undefined;
-      }
-      if (transcriptPath) {
-        knownTranscriptPaths.add(path.resolve(transcriptPath));
-      }
-      const messages = await readTranscriptMessages(transcriptPath, {
-        maxBytes: MAX_TRANSCRIPT_BYTES_FOR_SEARCH,
-      });
-      const excerpt = truncate(messages.at(-1)?.text ?? "", 220);
-      const title = titleForSession(key, entry, messages);
-      const channel = channelForSession(entry);
-      const status = stringValue(entry.status) || "active";
-      const model = modelForSession(entry);
-      const searchableText = createSearchableText({
-        key,
-        sessionId,
-        title,
-        channel,
-        status,
-        model,
-        entry,
-        messages,
-      });
-      const summary: SessionSummary = {
-        key,
-        sessionId,
-        updatedAt: finiteNumber(entry.updatedAt) ?? 0,
-        title,
-        channel,
-        status,
-        model,
-        excerpt,
-        searchableText,
-      };
-      const startedAt = finiteNumber(entry.sessionStartedAt) ?? finiteNumber(entry.startedAt);
-      if (startedAt !== undefined) {
-        summary.startedAt = startedAt;
-      }
-      const endedAt = finiteNumber(entry.endedAt);
-      if (endedAt !== undefined) {
-        summary.endedAt = endedAt;
-      }
-      const parentSessionKey = stringValue(entry.parentSessionKey);
-      if (parentSessionKey) {
-        summary.parentSessionKey = parentSessionKey;
-      }
-      const origin = {
-        label: stringValue(entry.origin?.label),
-        provider: stringValue(entry.origin?.provider),
-        surface: stringValue(entry.origin?.surface),
-        from: stringValue(entry.origin?.from),
-        to: stringValue(entry.origin?.to),
-      };
-      if (Object.values(origin).some(Boolean)) {
-        summary.origin = Object.fromEntries(
-          Object.entries(origin).filter((entry): entry is [string, string] => Boolean(entry[1])),
-        );
-      }
-      if (transcriptPath) {
-        summary.transcriptPath = transcriptPath;
-      }
-      return summary;
-    }),
+    candidates.map((candidate) => summarizeSessionCandidate(candidate)),
   );
-  const discovered = await loadDiscoveredTranscriptSummaries({
-    sessionsDir,
-    knownTranscriptPaths,
+  sessions.sort((a, b) => b.updatedAt - a.updatedAt || a.key.localeCompare(b.key));
+  return { storePath, sessions };
+}
+
+function serializeSessionSummary(session: SessionSummary): Record<string, unknown> {
+  return {
+    key: session.key,
+    sessionId: session.sessionId,
+    updatedAt: session.updatedAt,
+    startedAt: session.startedAt,
+    endedAt: session.endedAt,
+    title: session.title,
+    channel: session.channel,
+    status: session.status,
+    model: session.model,
+    parentSessionKey: session.parentSessionKey,
+    origin: session.origin,
+    transcriptPath: session.transcriptPath,
+    excerpt: session.excerpt,
+  };
+}
+
+function serializeTranscriptMessage(message: TranscriptMessage): Record<string, unknown> {
+  return {
+    index: message.index,
+    role: message.role,
+    timestamp: message.timestamp,
+    text: message.text,
+  };
+}
+
+async function loadSessionDetailPayload(params: {
+  api: OpenClawPluginApi;
+  key: string;
+}): Promise<Record<string, unknown> | undefined> {
+  const data = await loadSessionSummaries(params.api);
+  const session = data.sessions.find((entry) => entry.key === params.key);
+  if (!session) {
+    return undefined;
+  }
+  const messages = await readTranscriptMessages(session.transcriptPath, {
+    maxMessages: MAX_DETAIL_MESSAGES,
   });
-  const merged = [...sessions, ...discovered];
-  merged.sort((a, b) => b.updatedAt - a.updatedAt || a.key.localeCompare(b.key));
-  return { storePath, sessions: merged };
+  return {
+    ok: true,
+    session: serializeSessionSummary(session),
+    messages: messages.map(serializeTranscriptMessage),
+  };
+}
+
+async function loadSessionSummaryBatch(params: {
+  api: OpenClawPluginApi;
+  query: string;
+  offset: number;
+  limit: number;
+}): Promise<Record<string, unknown>> {
+  const storePath = resolveSessionStorePath(params.api);
+  const candidates = await resolveSessionSummaryCandidates({ api: params.api, storePath });
+  const normalizedQuery = params.query.trim().toLowerCase();
+  const items: Record<string, unknown>[] = [];
+  let nextOffset = Math.min(params.offset, candidates.length);
+  const maxScanned = normalizedQuery ? Math.max(params.limit * 4, 100) : params.limit;
+  let scannedThisBatch = 0;
+  while (
+    nextOffset < candidates.length &&
+    items.length < params.limit &&
+    scannedThisBatch < maxScanned
+  ) {
+    const summary = await summarizeSessionCandidate(candidates[nextOffset]);
+    nextOffset += 1;
+    scannedThisBatch += 1;
+    if (!normalizedQuery || summary.searchableText.includes(normalizedQuery)) {
+      items.push(serializeSessionSummary(summary));
+    }
+  }
+  return {
+    ok: true,
+    storePath,
+    items,
+    offset: params.offset,
+    nextOffset,
+    done: nextOffset >= candidates.length,
+    totalCandidates: candidates.length,
+    scanned: nextOffset,
+  };
 }
 
 function renderShell(params: {
@@ -928,6 +1144,7 @@ function renderShell(params: {
   pluginName: string;
   pluginVersion?: string;
   showSessionActionPath?: string;
+  apiSessionsPath?: string;
 }): string {
   return `<!doctype html>
 <html lang="en">
@@ -1028,7 +1245,13 @@ function renderShell(params: {
         display: grid;
         gap: 6px;
         min-width: 0;
+        width: 100%;
+        padding: 0;
+        border: 0;
+        border-radius: 0;
+        background: transparent;
         text-decoration: none;
+        text-align: left;
         color: inherit;
       }
       .session-row__agent {
@@ -1258,7 +1481,8 @@ function renderShell(params: {
     <script>
       const searchInput = document.querySelector("[data-session-search]");
       const list = document.querySelector("[data-session-list]");
-      const rows = Array.from(document.querySelectorAll("[data-session-row]"));
+      let rows = Array.from(document.querySelectorAll("[data-session-row]"));
+      const detailHost = document.querySelector("[data-session-detail-host]");
       const details = Array.from(document.querySelectorAll("[data-session-detail]"));
       const clearButtons = Array.from(document.querySelectorAll("[data-clear-search]"));
       const listOnlyControls = Array.from(document.querySelectorAll("[data-list-only-control]"));
@@ -1274,7 +1498,15 @@ function renderShell(params: {
       const toast = document.querySelector("[data-toast]");
       const count = document.querySelector("[data-session-count]");
       const summary = document.querySelector("[data-session-summary]");
+      const apiSessionsPath = ${serializeForInlineScript(params.apiSessionsPath ?? "")};
+      const sessionLoading = document.querySelector("[data-session-loading]");
+      const sessionStorePath = document.querySelector("[data-session-store-path]");
+      const apiSessionDetailPath = apiSessionsPath.replace(/\\/api\\/sessions$/, "/api/session");
       let liveSearchEnabled = true;
+      let loadGeneration = 0;
+      let loadedMatches = 0;
+      let scannedSessions = 0;
+      let totalCandidates = 0;
       let liveSearchBeforeDetail;
       let currentDetailId;
       let toastTimer;
@@ -1296,6 +1528,9 @@ function renderShell(params: {
         if (event.data?.type === "openclaw.pluginUi.connect" && event.ports?.[0]) {
           pluginUiBridgePort = event.ports[0];
           pluginUiBridgePort.start();
+          if (apiSessionsPath && rows.length === 0) {
+            window.setTimeout(loadSessions, 0);
+          }
           return;
         }
         if (event.data?.type !== "openclaw.pluginUi.response") return;
@@ -1338,7 +1573,7 @@ function renderShell(params: {
         });
       };
       const updateMessageSelectionBar = () => {
-        const selectedCount = messageAgentToggles.filter(
+        const selectedCount = getMessageAgentToggles().filter(
           (button) => button.getAttribute("aria-pressed") === "true",
         ).length;
         selectionBar?.toggleAttribute("hidden", selectedCount === 0);
@@ -1353,8 +1588,10 @@ function renderShell(params: {
           message?.removeAttribute("data-agent-selected");
         }
       };
+      const getMessageAgentToggles = () =>
+        Array.from(document.querySelectorAll("[data-message-agent-toggle]"));
       const clearSelectedMessages = (scope) => {
-        for (const button of messageAgentToggles) {
+        for (const button of getMessageAgentToggles()) {
           if (scope && !scope.contains(button)) continue;
           setMessageToggleSelected(button, false);
         }
@@ -1420,15 +1657,207 @@ function renderShell(params: {
           button.disabled = false;
         }
       };
-      const applySearch = () => {
-        const query = searchInput?.value.trim().toLowerCase() ?? "";
-        let visible = 0;
-        for (const row of rows) {
-          const matched = !query || (row.getAttribute("data-search") ?? "").includes(query);
-          row.toggleAttribute("hidden", !matched);
-          if (matched) visible += 1;
+      const escapeText = (value) =>
+        String(value ?? "").replace(/[&<>"']/g, (char) => ({
+          "&": "&amp;",
+          "<": "&lt;",
+          ">": "&gt;",
+          '"': "&quot;",
+          "'": "&#39;",
+        })[char]);
+      const formatTime = (value) => {
+        if (typeof value !== "number" || !Number.isFinite(value)) return "unknown";
+        return new Date(value).toLocaleString();
+      };
+      const updateSessionSummary = (done) => {
+        if (count) count.textContent = String(loadedMatches);
+        if (summary) {
+          const totalText = totalCandidates ? " of " + String(totalCandidates) : "";
+          const statusText = done ? "Showing " : "Loading ";
+          const storeText = sessionStorePath?.textContent
+            ? " from <code>" + escapeText(sessionStorePath.textContent) + "</code>"
+            : "";
+          summary.innerHTML =
+            statusText +
+            '<span data-session-count>' +
+            String(loadedMatches) +
+            "</span>" +
+            totalText +
+            " matched sessions" +
+            storeText +
+            ".";
         }
-        if (count) count.textContent = String(visible);
+      };
+      const renderSessionRow = (session) => {
+        const excerpt = session.excerpt
+          ? '<p class="excerpt subtle">' + escapeText(session.excerpt) + "</p>"
+          : '<p class="excerpt subtle">No transcript preview available.</p>';
+        return '<section class="session-row session-row--result" data-session-row>' +
+          '<button class="session-row__link" type="button" data-session-detail-link data-session-key="' + escapeText(session.key) + '">' +
+          '<span class="session-title">' + escapeText(session.title) + "</span>" +
+          '<span class="session-fields subtle">' +
+          "<span>" + escapeText(formatTime(session.updatedAt)) + "</span>" +
+          "<span>" + escapeText(session.channel) + "</span>" +
+          "<span>" + escapeText(session.status) + "</span>" +
+          "<span>" + escapeText(session.model) + "</span>" +
+          "<span><code>" + escapeText(session.key) + "</code></span>" +
+          "</span>" +
+          excerpt +
+          "</button>" +
+          '<span class="session-row__actions">' +
+          '<button class="session-row__agent" type="button" data-show-session-agent data-session-key="' + escapeText(session.key) + '" title="Show Session to Agent" aria-label="Show Session to Agent">👀</button>' +
+          '<button class="session-row__agent" type="button" data-resume-session data-session-key="' + escapeText(session.key) + '" title="Resume Session" aria-label="Resume Session">→</button>' +
+          "</span>" +
+          "</section>";
+      };
+      const labelForRole = (role) => {
+        const normalized = String(role || "").trim().toLowerCase();
+        if (normalized === "user") return "You";
+        if (normalized === "assistant") return "Assistant";
+        if (normalized === "tool" || normalized === "function") return "Tool";
+        return String(role || "Message");
+      };
+      const normalizedRole = (role) => {
+        const normalized = String(role || "").trim().toLowerCase();
+        if (normalized === "user" || normalized === "assistant") return normalized;
+        if (normalized === "tool" || normalized === "function") return "tool";
+        return "other";
+      };
+      const renderMessage = (message) => {
+        const roleLabel = labelForRole(message.role);
+        const roleClass = normalizedRole(message.role);
+        const avatar = roleLabel.slice(0, 1).toUpperCase();
+        return '<article class="message message--' + escapeText(roleClass) + '" data-message data-message-index="' + escapeText(message.index) + '">' +
+          '<div class="message-avatar" aria-hidden="true">' + escapeText(avatar) + '</div>' +
+          '<div class="message-body">' +
+          '<div class="message-meta">' +
+          '<span>' + escapeText(roleLabel) + '</span>' +
+          '<span class="message-time">' + escapeText(formatTime(message.timestamp)) + '</span>' +
+          '<button class="message-agent-toggle" type="button" data-message-agent-toggle data-message-index="' + escapeText(message.index) + '" aria-pressed="false" title="show agent" aria-label="show agent">👀</button>' +
+          '<button class="message-agent-toggle" type="button" data-resume-session-from-here data-message-index="' + escapeText(message.index) + '" title="Resume Session from Here" aria-label="Resume Session from Here">→</button>' +
+          '</div>' +
+          '<p class="message-text">' + escapeText(message.text) + '</p>' +
+          '</div>' +
+          '</article>';
+      };
+      const renderDetail = (session, messages) => {
+        const messageHtml = messages.length
+          ? messages.map(renderMessage).join("")
+          : '<p class="subtle">No transcript messages found.</p>';
+        return '<section class="detail-panel" data-session-detail data-session-key="' + escapeText(session.key) + '">' +
+          '<div class="detail-actions">' +
+          '<a href="#sessions" data-back-to-sessions>Back to sessions</a>' +
+          '<span class="detail-actions__buttons">' +
+          '<button type="button" data-show-session-agent data-session-key="' + escapeText(session.key) + '">Show Session to Agent</button>' +
+          '<button type="button" data-resume-session data-session-key="' + escapeText(session.key) + '">Resume Session</button>' +
+          '</span>' +
+          '</div>' +
+          '<section class="session-row">' +
+          '<span class="session-title">' + escapeText(session.title) + '</span>' +
+          '<span class="session-fields subtle">' +
+          '<span>' + escapeText(formatTime(session.updatedAt)) + '</span>' +
+          '<span>' + escapeText(session.channel) + '</span>' +
+          '<span>' + escapeText(session.status) + '</span>' +
+          '<span>' + escapeText(session.model) + '</span>' +
+          '<span><code>' + escapeText(session.key) + '</code></span>' +
+          '</span>' +
+          '</section>' +
+          '<h2>Transcript</h2>' +
+          '<section class="message-list">' + messageHtml + '</section>' +
+          '</section>';
+      };
+      const showLoadedDetail = async (sessionKey) => {
+        if (!sessionKey || !detailHost || !apiSessionDetailPath) return;
+        loadGeneration += 1;
+        showSessions();
+        list?.setAttribute("hidden", "");
+        summary?.setAttribute("hidden", "");
+        for (const control of listOnlyControls) control.setAttribute("hidden", "");
+        detailHost.removeAttribute("hidden");
+        detailHost.innerHTML = '<p class="subtle">Loading transcript...</p>';
+        try {
+          const params = new URLSearchParams();
+          params.set("key", sessionKey);
+          const response = await pluginUiRequest(apiSessionDetailPath + "?" + params.toString(), {
+            method: "GET",
+            headers: { accept: "application/json" },
+          });
+          const payload = JSON.parse(response.body);
+          if (!payload.ok || !payload.session) {
+            detailHost.innerHTML = '<p class="subtle">Session not found.</p>';
+            return;
+          }
+          detailHost.innerHTML = renderDetail(payload.session, Array.isArray(payload.messages) ? payload.messages : []);
+          currentDetailId = sessionKey;
+        } catch {
+          detailHost.innerHTML = '<p class="subtle">Could not load transcript.</p>';
+          showToast("Could not load transcript.");
+        }
+      };
+      const resetSessionList = () => {
+        rows = [];
+        loadedMatches = 0;
+        scannedSessions = 0;
+        totalCandidates = 0;
+        if (list) {
+          list.innerHTML = '<p class="subtle" data-session-loading>Loading sessions...</p>';
+        }
+        updateSessionSummary(false);
+      };
+      const appendSessionRows = (items) => {
+        if (!list || items.length === 0) return;
+        const loading = list.querySelector("[data-session-loading]");
+        loading?.remove();
+        list.insertAdjacentHTML("beforeend", items.map(renderSessionRow).join(""));
+        rows = Array.from(document.querySelectorAll("[data-session-row]"));
+        loadedMatches += items.length;
+      };
+      const loadSessions = async () => {
+        if (!apiSessionsPath || !list) return;
+        const generation = ++loadGeneration;
+        const query = searchInput?.value.trim() ?? "";
+        let offset = 0;
+        resetSessionList();
+        while (generation === loadGeneration) {
+          const searchParams = new URLSearchParams();
+          searchParams.set("offset", String(offset));
+          searchParams.set("limit", "25");
+          if (query) searchParams.set("q", query);
+          let payload;
+          try {
+            const response = await pluginUiRequest(apiSessionsPath + "?" + searchParams.toString(), {
+              method: "GET",
+              headers: { accept: "application/json" },
+            });
+            payload = JSON.parse(response.body);
+          } catch {
+            if (generation === loadGeneration) {
+              if (list) list.innerHTML = '<p class="subtle">Could not load sessions.</p>';
+              showToast("Could not load sessions.");
+            }
+            return;
+          }
+          if (generation !== loadGeneration) return;
+          if (typeof payload.storePath === "string" && sessionStorePath) {
+            sessionStorePath.textContent = payload.storePath;
+          }
+          totalCandidates = Number(payload.totalCandidates) || totalCandidates;
+          scannedSessions = Number(payload.scanned) || scannedSessions;
+          appendSessionRows(Array.isArray(payload.items) ? payload.items : []);
+          updateSessionSummary(Boolean(payload.done));
+          if (payload.done) {
+            if (loadedMatches === 0 && list) {
+              list.innerHTML = '<p class="subtle">No sessions matched.</p>';
+            }
+            return;
+          }
+          offset = Number(payload.nextOffset);
+          if (!Number.isFinite(offset) || offset <= scannedSessions - 1) return;
+          await new Promise((resolve) => window.setTimeout(resolve, 0));
+        }
+      };
+      const applySearch = () => {
+        updateSessionSummary(false);
       };
       const showSessions = () => {
         clearSelectedMessages();
@@ -1440,11 +1869,16 @@ function renderShell(params: {
         }
         list?.removeAttribute("hidden");
         summary?.removeAttribute("hidden");
+        detailHost?.setAttribute("hidden", "");
         for (const control of listOnlyControls) control.removeAttribute("hidden");
         for (const detail of details) detail.setAttribute("hidden", "");
       };
       const showSelectedDetail = () => {
         const selectedId = window.location.hash.slice(1);
+        if (selectedId.startsWith("session/")) {
+          showLoadedDetail(decodeURIComponent(selectedId.slice("session/".length)));
+          return;
+        }
         const selectedDetail = details.find((detail) => detail.id === selectedId);
         if (!selectedDetail) {
           showSessions();
@@ -1471,7 +1905,7 @@ function renderShell(params: {
           history.replaceState(null, "", "#sessions");
         }
         showSessions();
-        applySearch();
+        loadSessions();
       };
       const updateLiveSearchToggle = () => {
         if (!liveSearchToggle) return;
@@ -1515,9 +1949,11 @@ function renderShell(params: {
         clearSelectedMessages();
       });
       showSelectedAgentButton?.addEventListener("click", () => {
-        const activeDetail = details.find((detail) => !detail.hasAttribute("hidden"));
+        const activeDetail =
+          detailHost?.querySelector("[data-session-detail]") ??
+          details.find((detail) => !detail.hasAttribute("hidden"));
         const sessionKey = activeDetail?.getAttribute("data-session-key") ?? "";
-        const selectedMessageIndexes = messageAgentToggles
+        const selectedMessageIndexes = getMessageAgentToggles()
           .filter(
             (button) =>
               button.getAttribute("aria-pressed") === "true" &&
@@ -1561,6 +1997,69 @@ function renderShell(params: {
           });
         });
       }
+      list?.addEventListener("click", (event) => {
+        const link = event.target?.closest?.("[data-session-detail-link]");
+        if (link && list.contains(link)) {
+          event.preventDefault();
+          const sessionKey = link.getAttribute("data-session-key") ?? "";
+          const href = "#session/" + encodeURIComponent(sessionKey);
+          history.replaceState(null, "", href);
+          showLoadedDetail(sessionKey);
+          return;
+        }
+        const button = event.target?.closest?.("[data-show-session-agent], [data-resume-session]");
+        if (!button || !list.contains(button)) return;
+        const sessionKey = button.getAttribute("data-session-key") ?? "";
+        if (button.hasAttribute("data-resume-session")) {
+          submitSessionToAgent(button, sessionKey, { resumeSession: true });
+          return;
+        }
+        submitSessionToAgent(button, sessionKey);
+      });
+      detailHost?.addEventListener("click", (event) => {
+        const backLink = event.target?.closest?.("[data-back-to-sessions]");
+        if (backLink && detailHost.contains(backLink)) {
+          event.preventDefault();
+          history.replaceState(null, "", "#sessions");
+          showSessions();
+          return;
+        }
+        const messageToggle = event.target?.closest?.("[data-message-agent-toggle]");
+        if (messageToggle && detailHost.contains(messageToggle)) {
+          setMessageToggleSelected(
+            messageToggle,
+            messageToggle.getAttribute("aria-pressed") !== "true",
+          );
+          updateMessageSelectionBar();
+          return;
+        }
+        const resumeFromHere = event.target?.closest?.("[data-resume-session-from-here]");
+        if (resumeFromHere && detailHost.contains(resumeFromHere)) {
+          const activeDetail = resumeFromHere.closest("[data-session-detail]");
+          const sessionKey = activeDetail?.getAttribute("data-session-key") ?? "";
+          const resumeThroughMessageIndex = Number.parseInt(
+            resumeFromHere.getAttribute("data-message-index") ?? "",
+            10,
+          );
+          if (!Number.isSafeInteger(resumeThroughMessageIndex) || resumeThroughMessageIndex < 0) {
+            showToast("Could not resume session.");
+            return;
+          }
+          submitSessionToAgent(resumeFromHere, sessionKey, {
+            resumeSession: true,
+            resumeThroughMessageIndex,
+          });
+          return;
+        }
+        const button = event.target?.closest?.("[data-show-session-agent], [data-resume-session]");
+        if (!button || !detailHost.contains(button)) return;
+        const sessionKey = button.getAttribute("data-session-key") ?? "";
+        if (button.hasAttribute("data-resume-session")) {
+          submitSessionToAgent(button, sessionKey, { resumeSession: true });
+          return;
+        }
+        submitSessionToAgent(button, sessionKey);
+      });
       window.addEventListener("message", (event) => {
         const payload = event.data;
         if (payload?.type !== "session-search.showSessionResult") return;
@@ -1595,7 +2094,11 @@ function renderShell(params: {
       window.addEventListener("hashchange", showSelectedDetail);
       showSelectedDetail();
       updateLiveSearchToggle();
-      applySearch();
+      if (apiSessionsPath) {
+        window.setTimeout(loadSessions, 0);
+      } else {
+        applySearch();
+      }
       updateMessageSelectionBar();
     </script>
   </body>
@@ -1609,84 +2112,32 @@ async function renderListPage(params: {
   storePath: string;
   showSessionActionPath?: string;
   query: string;
-  limit: number;
+  limit?: number;
   sessions: SessionSummary[];
 }): Promise<string> {
-  const normalizedQuery = params.query.trim().toLowerCase();
-  const filtered = normalizedQuery
-    ? params.sessions.filter((session) => session.searchableText.includes(normalizedQuery))
-    : params.sessions;
-  const shown = filtered.slice(0, params.limit);
-  const detailMessages = await Promise.all(
-    shown.map((session) =>
-      readTranscriptMessages(session.transcriptPath, {
-        maxMessages: MAX_DETAIL_MESSAGES,
-      }),
-    ),
-  );
-  const rows = shown
-    .map((session, index) => {
-      const targetId = `session-${index}`;
-      return `<section class="session-row session-row--result" data-session-row data-search="${escapeHtml(
-        session.searchableText,
-      )}">
-        <a class="session-row__link" href="#${escapeHtml(targetId)}">
-          <span class="session-title">${escapeHtml(session.title)}</span>
-          <span class="session-fields subtle">
-            <span>${escapeHtml(formatTimestamp(session.updatedAt))}</span>
-            <span>${escapeHtml(session.channel)}</span>
-            <span>${escapeHtml(session.status)}</span>
-            <span>${escapeHtml(session.model)}</span>
-            <span><code>${escapeHtml(session.key)}</code></span>
-          </span>
-          ${
-            session.excerpt
-              ? `<p class="excerpt subtle">${escapeHtml(session.excerpt)}</p>`
-              : `<p class="excerpt subtle">No transcript preview available.</p>`
-          }
-        </a>
-        <span class="session-row__actions">
-          <button class="session-row__agent" type="button" data-show-session-agent data-session-key="${escapeHtml(
-            session.key,
-          )}" title="Show Session to Agent" aria-label="Show Session to Agent">👀</button>
-          <button class="session-row__agent" type="button" data-resume-session data-session-key="${escapeHtml(
-            session.key,
-          )}" title="Resume Session" aria-label="Resume Session">→</button>
-        </span>
-      </section>`;
-    })
-    .join("");
-  const detailPanels = shown
-    .map((session, index) =>
-      renderDetailPanel({
-        id: `session-${index}`,
-        session,
-        messages: detailMessages[index] ?? [],
-      }),
-    )
-    .join("");
   const body = `
     <form>
-      <input data-session-search name="q" value="${escapeHtml(params.query)}" placeholder="Search recent sessions" autocomplete="off">
+      <input data-session-search name="q" value="${escapeHtml(params.query)}" placeholder="Search sessions" autocomplete="off">
       <button type="submit">Search</button>
     </form>
     <div class="toolbar">
       <button type="button" data-clear-search data-list-only-control>Clear search</button>
       <button type="button" data-live-search-toggle aria-pressed="true" aria-label="Real-time search on">Live: On</button>
     </div>
-    <p class="subtle" data-session-summary>Showing <span data-session-count>${shown.length}</span> of ${filtered.length} matched sessions from <code>${escapeHtml(params.storePath)}</code>.</p>
+    <p class="subtle" data-session-summary>Loading <span data-session-count>0</span> matched sessions<span hidden><code data-session-store-path></code></span>.</p>
     <section class="session-list" id="sessions" data-session-list>
-      ${rows || `<p class="subtle">No sessions matched.</p>`}
+      <p class="subtle" data-session-loading>Loading sessions...</p>
     </section>
+    <section data-session-detail-host hidden></section>
     <div class="toolbar toolbar--bottom" data-list-only-control>
       <button type="button" data-clear-search>Clear search</button>
-    </div>
-    ${detailPanels}`;
+    </div>`;
   return renderShell({
     title: "Session Search",
     pluginName: params.pluginName,
     pluginVersion: params.pluginVersion,
     showSessionActionPath: params.showSessionActionPath,
+    apiSessionsPath: `${params.entryPath}api/sessions`,
     body,
   });
 }
@@ -1729,6 +2180,8 @@ function renderDetailPanel(params: {
     </section>
   </section>`;
 }
+
+void renderDetailPanel;
 
 function renderTranscriptMessage(message: TranscriptMessage, messageId: string): string {
   const normalizedRole = normalizeMessageRole(message.role);
@@ -2026,8 +2479,30 @@ export function createSessionSearchPageHandler(
   return async (req, res) => {
     const url = new URL(req.url ?? params.entryPath, "http://localhost");
     const pathname = url.pathname;
-    const data = await loadSessionSummaries(params.api);
+    if (pathname === "/plugins/session-search/api/sessions" && req.method === "GET") {
+      return writeJson(
+        res,
+        200,
+        await loadSessionSummaryBatch({
+          api: params.api,
+          query: url.searchParams.get("q") ?? "",
+          offset: resolveOffset(url.searchParams.get("offset")),
+          limit: resolveBatchLimit(url.searchParams.get("limit")),
+        }),
+      );
+    }
+    if (pathname === "/plugins/session-search/api/session" && req.method === "GET") {
+      const payload = await loadSessionDetailPayload({
+        api: params.api,
+        key: url.searchParams.get("key") ?? "",
+      });
+      if (!payload) {
+        return writeJson(res, 404, { ok: false, error: "session_not_found" });
+      }
+      return writeJson(res, 200, payload);
+    }
     if (pathname === "/plugins/session-search/show-session" && req.method === "POST") {
+      const data = await loadSessionSummaries(params.api);
       return await handleShowSessionToAgent({
         api: params.api,
         req,
@@ -2043,16 +2518,17 @@ export function createSessionSearchPageHandler(
           pluginName: params.pluginName,
           pluginVersion: params.pluginVersion,
           entryPath: params.entryPath,
-          storePath: data.storePath,
+          storePath: "",
           showSessionActionPath: issueShowSessionActionPath(req),
           query: url.searchParams.get("q") ?? "",
           limit: resolveLimit(url.searchParams.get("limit")),
-          sessions: data.sessions,
+          sessions: [],
         }),
       );
     }
     const detailPrefix = `${params.entryPath}session/`;
     if (pathname.startsWith(detailPrefix)) {
+      const data = await loadSessionSummaries(params.api);
       const key = decodeURIComponent(pathname.slice(detailPrefix.length));
       const session = data.sessions.find((entry) => entry.key === key);
       if (!session) {
