@@ -87,6 +87,8 @@ type TranscriptMessage = {
   text: string;
 };
 
+type NormalizedMessageRole = "user" | "assistant" | "tool" | "system" | "other";
+
 type SessionSearchPageParams = {
   api: OpenClawPluginApi;
   pluginName: string;
@@ -550,6 +552,32 @@ function parseSelectedMessageIndexes(value: unknown): number[] | undefined {
   return indexes;
 }
 
+function parseIncludedMessageRoles(value: unknown): Set<NormalizedMessageRole> | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  let rawValues: unknown[] | undefined;
+  if (Array.isArray(value)) {
+    rawValues = value;
+  } else if (typeof value === "string") {
+    try {
+      const parsed = JSON.parse(value) as unknown;
+      rawValues = Array.isArray(parsed) ? parsed : value.split(",");
+    } catch {
+      rawValues = value.split(",");
+    }
+  }
+  if (!rawValues) {
+    return new Set();
+  }
+  const roles = new Set<NormalizedMessageRole>();
+  for (const rawValue of rawValues) {
+    const role = normalizeMessageRole(String(rawValue));
+    roles.add(role);
+  }
+  return roles;
+}
+
 function parseMessageIndex(value: unknown): number | undefined {
   if (value === undefined) {
     return undefined;
@@ -728,7 +756,7 @@ function modelForSession(entry: SessionEntryLike): string {
   return model || provider || "unknown";
 }
 
-function normalizeMessageRole(role: string): "user" | "assistant" | "tool" | "other" {
+function normalizeMessageRole(role: string): NormalizedMessageRole {
   const normalized = role.trim().toLowerCase();
   if (normalized === "user") {
     return "user";
@@ -736,8 +764,18 @@ function normalizeMessageRole(role: string): "user" | "assistant" | "tool" | "ot
   if (normalized === "assistant") {
     return "assistant";
   }
-  if (normalized === "tool" || normalized === "function") {
+  if (
+    normalized === "tool" ||
+    normalized === "toolresult" ||
+    normalized === "tool_result" ||
+    normalized === "tool-result" ||
+    normalized === "tool result" ||
+    normalized === "function"
+  ) {
     return "tool";
+  }
+  if (normalized === "system") {
+    return "system";
   }
   return "other";
 }
@@ -751,7 +789,10 @@ function labelForMessageRole(role: string): string {
     return "Assistant";
   }
   if (normalized === "tool") {
-    return "Tool";
+    return "Tool Result";
+  }
+  if (normalized === "system") {
+    return "System";
   }
   return role || "Message";
 }
@@ -1210,13 +1251,54 @@ function renderShell(params: {
       .toolbar {
         display: flex;
         gap: 8px;
-        justify-content: flex-end;
+        justify-content: space-between;
         align-items: center;
         margin: -8px 0 14px;
+      }
+      .toolbar__left,
+      .toolbar__right {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        align-items: center;
       }
       .toolbar button {
         padding-inline: 10px;
         white-space: nowrap;
+      }
+      .message-filter-controls {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        align-items: center;
+      }
+      .message-filter-controls__label {
+        font-size: 12px;
+        font-weight: 700;
+        color: color-mix(in srgb, CanvasText 62%, transparent);
+      }
+      .message-filter-controls__button {
+        display: inline-grid;
+        place-items: center;
+        min-width: 30px;
+        height: 28px;
+        padding: 0 7px;
+        border-radius: 999px;
+        line-height: 1;
+      }
+      .message-filter {
+        display: inline-flex;
+        gap: 4px;
+        align-items: center;
+        font-size: 12px;
+        font-weight: 600;
+        color: color-mix(in srgb, CanvasText 70%, transparent);
+        white-space: nowrap;
+      }
+      .message-filter input {
+        width: 13px;
+        height: 13px;
+        margin: 0;
       }
       .toolbar--bottom {
         margin: 14px 0 0;
@@ -1486,8 +1568,11 @@ function renderShell(params: {
       const details = Array.from(document.querySelectorAll("[data-session-detail]"));
       const clearButtons = Array.from(document.querySelectorAll("[data-clear-search]"));
       const listOnlyControls = Array.from(document.querySelectorAll("[data-list-only-control]"));
+      const detailOnlyControls = Array.from(document.querySelectorAll("[data-detail-only-control]"));
       const liveSearchToggle = document.querySelector("[data-live-search-toggle]");
       const messageAgentToggles = Array.from(document.querySelectorAll("[data-message-agent-toggle]"));
+      const selectVisibleMessagesButton = document.querySelector("[data-select-visible-messages]");
+      const clearAllMessageSelectionButton = document.querySelector("[data-clear-all-message-selection]");
       const showSessionAgentButtons = Array.from(document.querySelectorAll("[data-show-session-agent]"));
       const resumeSessionButtons = Array.from(document.querySelectorAll("[data-resume-session]"));
       const resumeFromHereButtons = Array.from(document.querySelectorAll("[data-resume-session-from-here]"));
@@ -1578,6 +1663,27 @@ function renderShell(params: {
         ).length;
         selectionBar?.toggleAttribute("hidden", selectedCount === 0);
       };
+      const getMessageRoleFilters = () =>
+        Array.from(document.querySelectorAll("[data-message-role-filter]"));
+      const checkedMessageRoles = () =>
+        getMessageRoleFilters()
+          .filter((checkbox) => checkbox.checked)
+          .map((checkbox) => checkbox.value);
+      const getActiveDetail = () => {
+        const hostedDetail = detailHost?.hasAttribute("hidden")
+          ? undefined
+          : detailHost?.querySelector("[data-session-detail]");
+        return hostedDetail ?? details.find((detail) => !detail.hasAttribute("hidden"));
+      };
+      const syncToolbarMode = () => {
+        const hasActiveDetail = Boolean(getActiveDetail());
+        for (const control of listOnlyControls) {
+          control.toggleAttribute("hidden", hasActiveDetail);
+        }
+        for (const control of detailOnlyControls) {
+          control.toggleAttribute("hidden", !hasActiveDetail);
+        }
+      };
       const setMessageToggleSelected = (button, selected) => {
         const message = button.closest("[data-message]");
         button.textContent = selected ? "✓" : "👀";
@@ -1597,6 +1703,30 @@ function renderShell(params: {
         }
         updateMessageSelectionBar();
       };
+      const applyMessageRoleFilters = () => {
+        const includedRoles = new Set(checkedMessageRoles());
+        for (const message of document.querySelectorAll("[data-message]")) {
+          const role = message.getAttribute("data-message-role") ?? "other";
+          message.toggleAttribute("hidden", !includedRoles.has(role));
+        }
+      };
+      const selectVisibleMessages = () => {
+        const activeDetail = getActiveDetail();
+        if (!activeDetail) return;
+        for (const button of getMessageAgentToggles()) {
+          if (activeDetail.contains(button)) {
+            setMessageToggleSelected(button, false);
+          }
+        }
+        for (const button of getMessageAgentToggles()) {
+          const message = button.closest("[data-message]");
+          if (!message || !activeDetail.contains(message) || message.hasAttribute("hidden")) {
+            continue;
+          }
+          setMessageToggleSelected(button, true);
+        }
+        updateMessageSelectionBar();
+      };
       const submitSessionToAgent = async (button, sessionKey, options = {}) => {
         if (!sessionKey) return;
         if (!showSessionActionPath) {
@@ -1608,6 +1738,9 @@ function renderShell(params: {
         body.set("sessionKey", sessionKey);
         if (options.selectedMessageIndexes) {
           body.set("selectedMessageIndexes", JSON.stringify(options.selectedMessageIndexes));
+        }
+        if (options.includedMessageRoles) {
+          body.set("includedMessageRoles", JSON.stringify(options.includedMessageRoles));
         }
         if (options.resumeSession) {
           body.set("resumeSession", "true");
@@ -1714,20 +1847,36 @@ function renderShell(params: {
         const normalized = String(role || "").trim().toLowerCase();
         if (normalized === "user") return "You";
         if (normalized === "assistant") return "Assistant";
-        if (normalized === "tool" || normalized === "function") return "Tool";
+        if (
+          normalized === "tool" ||
+          normalized === "toolresult" ||
+          normalized === "tool_result" ||
+          normalized === "tool-result" ||
+          normalized === "tool result" ||
+          normalized === "function"
+        ) return "Tool Result";
+        if (normalized === "system") return "System";
         return String(role || "Message");
       };
       const normalizedRole = (role) => {
         const normalized = String(role || "").trim().toLowerCase();
         if (normalized === "user" || normalized === "assistant") return normalized;
-        if (normalized === "tool" || normalized === "function") return "tool";
+        if (
+          normalized === "tool" ||
+          normalized === "toolresult" ||
+          normalized === "tool_result" ||
+          normalized === "tool-result" ||
+          normalized === "tool result" ||
+          normalized === "function"
+        ) return "tool";
+        if (normalized === "system") return "system";
         return "other";
       };
       const renderMessage = (message) => {
         const roleLabel = labelForRole(message.role);
         const roleClass = normalizedRole(message.role);
         const avatar = roleLabel.slice(0, 1).toUpperCase();
-        return '<article class="message message--' + escapeText(roleClass) + '" data-message data-message-index="' + escapeText(message.index) + '">' +
+        return '<article class="message message--' + escapeText(roleClass) + '" data-message data-message-role="' + escapeText(roleClass) + '" data-message-index="' + escapeText(message.index) + '">' +
           '<div class="message-avatar" aria-hidden="true">' + escapeText(avatar) + '</div>' +
           '<div class="message-body">' +
           '<div class="message-meta">' +
@@ -1772,9 +1921,9 @@ function renderShell(params: {
         showSessions();
         list?.setAttribute("hidden", "");
         summary?.setAttribute("hidden", "");
-        for (const control of listOnlyControls) control.setAttribute("hidden", "");
         detailHost.removeAttribute("hidden");
         detailHost.innerHTML = '<p class="subtle">Loading transcript...</p>';
+        syncToolbarMode();
         try {
           const params = new URLSearchParams();
           params.set("key", sessionKey);
@@ -1788,7 +1937,9 @@ function renderShell(params: {
             return;
           }
           detailHost.innerHTML = renderDetail(payload.session, Array.isArray(payload.messages) ? payload.messages : []);
+          applyMessageRoleFilters();
           currentDetailId = sessionKey;
+          syncToolbarMode();
         } catch {
           detailHost.innerHTML = '<p class="subtle">Could not load transcript.</p>';
           showToast("Could not load transcript.");
@@ -1870,8 +2021,8 @@ function renderShell(params: {
         list?.removeAttribute("hidden");
         summary?.removeAttribute("hidden");
         detailHost?.setAttribute("hidden", "");
-        for (const control of listOnlyControls) control.removeAttribute("hidden");
         for (const detail of details) detail.setAttribute("hidden", "");
+        syncToolbarMode();
       };
       const showSelectedDetail = () => {
         const selectedId = window.location.hash.slice(1);
@@ -1879,7 +2030,9 @@ function renderShell(params: {
           showLoadedDetail(decodeURIComponent(selectedId.slice("session/".length)));
           return;
         }
-        const selectedDetail = details.find((detail) => detail.id === selectedId);
+        const selectedDetail =
+          details.find((detail) => detail.id === selectedId) ??
+          (!list && details.length === 1 ? details[0] : undefined);
         if (!selectedDetail) {
           showSessions();
           return;
@@ -1895,10 +2048,11 @@ function renderShell(params: {
         }
         list?.setAttribute("hidden", "");
         summary?.setAttribute("hidden", "");
-        for (const control of listOnlyControls) control.setAttribute("hidden", "");
         for (const detail of details) {
           detail.toggleAttribute("hidden", detail !== selectedDetail);
         }
+        syncToolbarMode();
+        applyMessageRoleFilters();
       };
       const runSearch = () => {
         if (window.location.hash && window.location.hash !== "#sessions") {
@@ -1948,10 +2102,29 @@ function renderShell(params: {
       clearMessageSelection?.addEventListener("click", () => {
         clearSelectedMessages();
       });
+      clearAllMessageSelectionButton?.addEventListener("click", () => {
+        clearSelectedMessages();
+      });
+      selectVisibleMessagesButton?.addEventListener("click", selectVisibleMessages);
+      const handleMessageRoleFilterEvent = (event) => {
+        const checkbox = event.target?.closest?.("[data-message-role-filter]");
+        if (checkbox) applyMessageRoleFilters();
+      };
+      document.addEventListener("input", handleMessageRoleFilterEvent);
+      document.addEventListener("change", handleMessageRoleFilterEvent);
+      document.addEventListener("click", (event) => {
+        const filter = event.target?.closest?.("[data-message-role-filter]");
+        if (filter) {
+          window.setTimeout(applyMessageRoleFilters, 0);
+          return;
+        }
+        const filterLabel = event.target?.closest?.(".message-filter");
+        if (filterLabel) {
+          window.setTimeout(applyMessageRoleFilters, 0);
+        }
+      });
       showSelectedAgentButton?.addEventListener("click", () => {
-        const activeDetail =
-          detailHost?.querySelector("[data-session-detail]") ??
-          details.find((detail) => !detail.hasAttribute("hidden"));
+        const activeDetail = getActiveDetail();
         const sessionKey = activeDetail?.getAttribute("data-session-key") ?? "";
         const selectedMessageIndexes = getMessageAgentToggles()
           .filter(
@@ -1970,13 +2143,20 @@ function renderShell(params: {
       for (const button of showSessionAgentButtons) {
         button.addEventListener("click", () => {
           const sessionKey = button.getAttribute("data-session-key") ?? "";
-          submitSessionToAgent(button, sessionKey);
+          const activeDetail = button.closest("[data-session-detail]");
+          submitSessionToAgent(button, sessionKey, {
+            ...(activeDetail ? { includedMessageRoles: checkedMessageRoles() } : {}),
+          });
         });
       }
       for (const button of resumeSessionButtons) {
         button.addEventListener("click", () => {
           const sessionKey = button.getAttribute("data-session-key") ?? "";
-          submitSessionToAgent(button, sessionKey, { resumeSession: true });
+          const activeDetail = button.closest("[data-session-detail]");
+          submitSessionToAgent(button, sessionKey, {
+            resumeSession: true,
+            ...(activeDetail ? { includedMessageRoles: checkedMessageRoles() } : {}),
+          });
         });
       }
       for (const button of resumeFromHereButtons) {
@@ -1994,6 +2174,7 @@ function renderShell(params: {
           submitSessionToAgent(button, sessionKey, {
             resumeSession: true,
             resumeThroughMessageIndex,
+            includedMessageRoles: checkedMessageRoles(),
           });
         });
       }
@@ -2048,6 +2229,7 @@ function renderShell(params: {
           submitSessionToAgent(resumeFromHere, sessionKey, {
             resumeSession: true,
             resumeThroughMessageIndex,
+            includedMessageRoles: checkedMessageRoles(),
           });
           return;
         }
@@ -2055,10 +2237,13 @@ function renderShell(params: {
         if (!button || !detailHost.contains(button)) return;
         const sessionKey = button.getAttribute("data-session-key") ?? "";
         if (button.hasAttribute("data-resume-session")) {
-          submitSessionToAgent(button, sessionKey, { resumeSession: true });
+          submitSessionToAgent(button, sessionKey, {
+            resumeSession: true,
+            includedMessageRoles: checkedMessageRoles(),
+          });
           return;
         }
-        submitSessionToAgent(button, sessionKey);
+        submitSessionToAgent(button, sessionKey, { includedMessageRoles: checkedMessageRoles() });
       });
       window.addEventListener("message", (event) => {
         const payload = event.data;
@@ -2099,6 +2284,8 @@ function renderShell(params: {
       } else {
         applySearch();
       }
+      syncToolbarMode();
+      applyMessageRoleFilters();
       updateMessageSelectionBar();
     </script>
   </body>
@@ -2120,10 +2307,7 @@ async function renderListPage(params: {
       <input data-session-search name="q" value="${escapeHtml(params.query)}" placeholder="Search sessions" autocomplete="off">
       <button type="submit">Search</button>
     </form>
-    <div class="toolbar">
-      <button type="button" data-clear-search data-list-only-control>Clear search</button>
-      <button type="button" data-live-search-toggle aria-pressed="true" aria-label="Real-time search on">Live: On</button>
-    </div>
+    ${renderMessageToolbar({ includeSearchClear: true })}
     <p class="subtle" data-session-summary>Loading <span data-session-count>0</span> matched sessions<span hidden><code data-session-store-path></code></span>.</p>
     <section class="session-list" id="sessions" data-session-list>
       <p class="subtle" data-session-loading>Loading sessions...</p>
@@ -2140,6 +2324,27 @@ async function renderListPage(params: {
     apiSessionsPath: `${params.entryPath}api/sessions`,
     body,
   });
+}
+
+function renderMessageToolbar(params: { includeSearchClear?: boolean } = {}): string {
+  return `<div class="toolbar">
+      <span class="toolbar__left">
+        <span class="message-filter-controls" data-detail-only-control hidden>
+          <button class="message-filter-controls__button" type="button" data-select-visible-messages title="Select All Messages" aria-label="Select All Messages">👀</button>
+          <button class="message-filter-controls__button" type="button" data-clear-all-message-selection title="Clear Selection" aria-label="Clear Selection">×</button>
+          <span class="message-filter-controls__label">Filter Messages:</span>
+          <label class="message-filter"><input type="checkbox" data-message-role-filter value="assistant" checked> Assistant</label>
+          <label class="message-filter"><input type="checkbox" data-message-role-filter value="user" checked> User</label>
+          <label class="message-filter"><input type="checkbox" data-message-role-filter value="tool" checked> Tool Result</label>
+          <label class="message-filter"><input type="checkbox" data-message-role-filter value="system" checked> System</label>
+          <label class="message-filter"><input type="checkbox" data-message-role-filter value="other" checked> Other</label>
+        </span>
+      </span>
+      <span class="toolbar__right">
+        ${params.includeSearchClear ? `<button type="button" data-clear-search data-list-only-control>Clear search</button>` : ""}
+        <button type="button" data-live-search-toggle aria-pressed="true" aria-label="Real-time search on">Live: On</button>
+      </span>
+    </div>`;
 }
 
 function renderDetailPanel(params: {
@@ -2187,7 +2392,9 @@ function renderTranscriptMessage(message: TranscriptMessage, messageId: string):
   const normalizedRole = normalizeMessageRole(message.role);
   const roleLabel = labelForMessageRole(message.role);
   const avatarLabel = roleLabel.slice(0, 1).toUpperCase();
-  return `<article class="message message--${escapeHtml(normalizedRole)}" data-message data-message-index="${message.index}">
+  return `<article class="message message--${escapeHtml(normalizedRole)}" data-message data-message-role="${escapeHtml(
+    normalizedRole,
+  )}" data-message-index="${message.index}">
     <div class="message-avatar" aria-hidden="true">${escapeHtml(avatarLabel)}</div>
     <div class="message-body">
       <div class="message-meta">
@@ -2215,6 +2422,10 @@ function renderDetailPage(params: {
     .map((message, index) => renderTranscriptMessage(message, `detail-message-${index}`))
     .join("");
   const body = `
+    ${renderMessageToolbar()}
+    <section class="detail-panel" data-session-detail data-session-key="${escapeHtml(
+      params.session.key,
+    )}">
     <div class="detail-actions">
       <a href="${escapeHtml(params.entryPath)}">Back to sessions</a>
       <span class="detail-actions__buttons">
@@ -2239,6 +2450,7 @@ function renderDetailPage(params: {
     <h2>Transcript</h2>
     <section class="message-list">
       ${messageHtml || `<p class="subtle">No transcript messages found.</p>`}
+    </section>
     </section>`;
   return renderShell({
     title: params.session.title,
@@ -2367,11 +2579,17 @@ async function handleShowSessionToAgent(params: {
   const selectedOnly = selectedMessageIndexes !== undefined;
   const selectedMessageIndexSet =
     selectedMessageIndexes === undefined ? undefined : new Set(selectedMessageIndexes);
+  const includedMessageRoleSet = selectedMessageIndexSet
+    ? undefined
+    : parseIncludedMessageRoles(body.includedMessageRoles);
+  const filteredMessages = includedMessageRoleSet
+    ? allMessages.filter((message) => includedMessageRoleSet.has(normalizeMessageRole(message.role)))
+    : allMessages;
   const messages = selectedMessageIndexSet
     ? allMessages.filter((message) => selectedMessageIndexSet.has(message.index))
     : resumeThroughMessageIndex !== undefined
-      ? allMessages.filter((message) => message.index <= resumeThroughMessageIndex)
-      : allMessages;
+      ? filteredMessages.filter((message) => message.index <= resumeThroughMessageIndex)
+      : filteredMessages;
   if (selectedOnly && messages.length === 0) {
     return writeActionResult(params.req, params.res, 400, {
       ok: false,

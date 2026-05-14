@@ -88,6 +88,14 @@ describe("session-search plugin", () => {
             timestamp: 1_700_000_001_000,
           },
         }),
+        JSON.stringify({
+          type: "message",
+          message: {
+            role: "toolResult",
+            content: "Tool output belongs with tool result filters.",
+            timestamp: 1_700_000_002_000,
+          },
+        }),
         "",
       ].join("\n"),
     );
@@ -172,6 +180,17 @@ describe("session-search plugin", () => {
     expect(res.setHeader).toHaveBeenCalledWith("cache-control", "no-store");
     expect(chunks.join("")).toContain("Session Search");
     expect(chunks.join("")).toContain("Loading sessions");
+    expect(chunks.join("")).toContain('data-select-visible-messages title="Select All Messages"');
+    expect(chunks.join("")).toContain('data-clear-all-message-selection title="Clear Selection"');
+    expect(chunks.join("")).toContain('data-message-role-filter value="assistant" checked');
+    chunks.length = 0;
+
+    await route.handler({ url: "/plugins/session-search/session/main" } as never, res as never);
+
+    expect(res.statusCode).toBe(200);
+    expect(chunks.join("")).toContain('data-message-role="tool"');
+    expect(chunks.join("")).toContain("Tool Result");
+    expect(chunks.join("")).toContain("Tool output belongs with tool result filters.");
     chunks.length = 0;
 
     await route.handler(
@@ -186,8 +205,7 @@ describe("session-search plugin", () => {
     expect(serializedItems).toContain("Find old deployment notes");
     expect(serializedItems).toContain("Older transcript outside sessions json");
     expect(serializedItems).toContain("Deleted archived transcript still searchable");
-    expect(serializedItems).not.toContain("/plugins/session-search/session/main");
-    expect(payload.items?.[0]).not.toHaveProperty("detailPath");
+    expect(serializedItems).toContain("/plugins/session-search/session/main");
     await fs.rm(dir, { recursive: true, force: true });
   });
 
@@ -537,6 +555,132 @@ describe("session-search plugin", () => {
     await fs.rm(dir, { recursive: true, force: true });
   });
 
+  it("keeps selected messages even when role filters are submitted", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-session-search-test-"));
+    const storePath = path.join(dir, "sessions.json");
+    const transcriptPath = path.join(dir, "sess-main.jsonl");
+    const targetTranscriptPath = path.join(dir, "sess-active.jsonl");
+    await fs.writeFile(
+      storePath,
+      JSON.stringify({
+        main: {
+          sessionId: "sess-main",
+          updatedAt: 1_700_000_000_000,
+          sessionFile: transcriptPath,
+          lastChannel: "webchat",
+        },
+        "agent:main:active": {
+          sessionId: "sess-active",
+          updatedAt: 1_700_000_000_500,
+          sessionFile: targetTranscriptPath,
+          lastChannel: "webchat",
+        },
+      }),
+    );
+    await fs.writeFile(
+      transcriptPath,
+      [
+        JSON.stringify({
+          type: "message",
+          message: { role: "user", content: "Visible user message" },
+        }),
+        JSON.stringify({
+          type: "message",
+          message: { role: "assistant", content: "Hidden but selected assistant message" },
+        }),
+        "",
+      ].join("\n"),
+    );
+    const routes: Array<Parameters<OpenClawPluginApi["registerHttpRoute"]>[0]> = [];
+    const beforePromptBuildHandlers: Array<Parameters<OpenClawPluginApi["on"]>[1]> = [];
+    const api = createTestPluginApi({
+      id: "session-search",
+      name: "Session Search",
+      version: "test",
+      runtime: {
+        config: {
+          current: () => ({ session: { store: storePath } }) as never,
+        },
+        agent: {
+          session: {
+            resolveStorePath: () => storePath,
+            loadSessionStore: () => ({
+              main: {
+                sessionId: "sess-main",
+                updatedAt: 1_700_000_000_000,
+                sessionFile: transcriptPath,
+                lastChannel: "webchat",
+              },
+              "agent:main:active": {
+                sessionId: "sess-active",
+                updatedAt: 1_700_000_000_500,
+                sessionFile: targetTranscriptPath,
+                lastChannel: "webchat",
+              },
+            }),
+            resolveSessionFilePath: (sessionId: string) =>
+              sessionId === "sess-active" ? targetTranscriptPath : transcriptPath,
+            updateSessionStoreEntry: vi.fn(async () => ({})),
+          },
+        },
+      } as never,
+      registerHttpRoute(route) {
+        routes.push(route);
+      },
+      on(hookName, handler) {
+        if (hookName === "before_prompt_build") {
+          beforePromptBuildHandlers.push(handler);
+        }
+      },
+    });
+    registerSessionSearchPlugin(api);
+    const route = routes[0];
+    if (!route) {
+      throw new Error("expected session-search route registration");
+    }
+    const chunks: string[] = [];
+    const req = Readable.from([
+      JSON.stringify({
+        sessionKey: "main",
+        selectedMessageIndexes: [1],
+        includedMessageRoles: ["user"],
+      }),
+    ]) as unknown as Parameters<typeof route.handler>[0];
+    Object.assign(req, {
+      method: "POST",
+      url: "/plugins/session-search/show-session",
+      headers: {
+        accept: "application/json",
+        "content-type": "application/json",
+        "x-openclaw-plugin-ui-session-key": "agent:main:active",
+        "x-openclaw-plugin-ui-context-tokens": "10000",
+      },
+    });
+    const res = {
+      statusCode: 0,
+      setHeader: vi.fn(),
+      end: vi.fn((chunk: string) => {
+        chunks.push(chunk);
+      }),
+    };
+
+    await route.handler(req, res as never);
+
+    expect(res.statusCode).toBe(200);
+    const hookResult = (await beforePromptBuildHandlers[0]?.(
+      { prompt: "what did you get?", messages: [] },
+      { sessionKey: "agent:main:active" },
+    )) as { prependContext?: string } | undefined;
+    expect(hookResult?.prependContext).toContain("Hidden but selected assistant message");
+    expect(hookResult?.prependContext).not.toContain("Visible user message");
+    expect(JSON.parse(chunks.join(""))).toMatchObject({
+      ok: true,
+      injected: true,
+      selectedMessages: 1,
+    });
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+
   it("creates a resumed session and queues the source session into its context", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-session-search-test-"));
     const storePath = path.join(dir, "sessions.json");
@@ -821,6 +965,143 @@ describe("session-search plugin", () => {
     expect(sessionStore[resumedSessionKey]).toMatchObject({
       parentSessionKey: "main",
     });
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+
+  it("filters unchecked message roles out of resumed session context", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-session-search-test-"));
+    const storePath = path.join(dir, "sessions.json");
+    const transcriptPath = path.join(dir, "sess-main.jsonl");
+    await fs.mkdir(path.join(dir, "memory"), { recursive: true });
+    await fs.writeFile(path.join(dir, "AGENTS.md"), "AGENTS filtered resume guidance");
+    await fs.writeFile(path.join(dir, "SOUL.md"), "SOUL current persona");
+    await fs.writeFile(path.join(dir, "TOOLS.md"), "TOOLS current local notes");
+    await fs.writeFile(path.join(dir, "USER.md"), "USER current profile");
+    await fs.writeFile(path.join(dir, "MEMORY.md"), "ROOT MEMORY current distilled notes");
+    await fs.writeFile(path.join(dir, "memory", "2023-11-14.md"), "DAY 2023-11-14 memory");
+    const sessionStore: Record<string, Record<string, unknown>> = {
+      main: {
+        sessionId: "sess-main",
+        updatedAt: 1_700_000_000_000,
+        sessionStartedAt: 1_700_000_000_000,
+        sessionFile: transcriptPath,
+        lastChannel: "webchat",
+      },
+    };
+    await fs.writeFile(storePath, JSON.stringify(sessionStore));
+    await fs.writeFile(
+      transcriptPath,
+      [
+        JSON.stringify({
+          type: "message",
+          message: { role: "user", content: "User resume message" },
+        }),
+        JSON.stringify({
+          type: "message",
+          message: { role: "assistant", content: "Assistant resume message should be filtered" },
+        }),
+        JSON.stringify({
+          type: "message",
+          message: { role: "toolResult", content: "Tool resume message should be filtered" },
+        }),
+        JSON.stringify({
+          type: "message",
+          message: { role: "user", content: "Second user resume message" },
+        }),
+        "",
+      ].join("\n"),
+    );
+    const routes: Array<Parameters<OpenClawPluginApi["registerHttpRoute"]>[0]> = [];
+    const beforePromptBuildHandlers: Array<Parameters<OpenClawPluginApi["on"]>[1]> = [];
+    const api = createTestPluginApi({
+      id: "session-search",
+      name: "Session Search",
+      version: "test",
+      runtime: {
+        config: {
+          current: () =>
+            ({
+              session: { store: storePath },
+              agents: { defaults: { workspace: dir, userTimezone: "UTC" } },
+            }) as never,
+        },
+        agent: {
+          session: {
+            resolveStorePath: () => storePath,
+            loadSessionStore: () => sessionStore,
+            updateSessionStore: vi.fn(async (_storePath, mutator) => {
+              await mutator(sessionStore as never);
+              await fs.writeFile(storePath, JSON.stringify(sessionStore));
+            }),
+            updateSessionStoreEntry: vi.fn(async ({ sessionKey, update }) => {
+              const entry = sessionStore[sessionKey];
+              if (!entry) {
+                return null;
+              }
+              Object.assign(entry, await update(entry as never));
+              await fs.writeFile(storePath, JSON.stringify(sessionStore));
+              return entry;
+            }),
+            resolveSessionFilePath: (sessionId: string, entry?: { sessionFile?: string }) =>
+              entry?.sessionFile ?? path.join(dir, `${sessionId}.jsonl`),
+          },
+        },
+      } as never,
+      registerHttpRoute(route) {
+        routes.push(route);
+      },
+      on(hookName, handler) {
+        if (hookName === "before_prompt_build") {
+          beforePromptBuildHandlers.push(handler);
+        }
+      },
+    });
+    registerSessionSearchPlugin(api);
+    const route = routes[0];
+    if (!route) {
+      throw new Error("expected session-search route registration");
+    }
+    const chunks: string[] = [];
+    const req = Readable.from([
+      JSON.stringify({
+        sessionKey: "main",
+        resumeSession: true,
+        resumeThroughMessageIndex: 3,
+        includedMessageRoles: ["user"],
+      }),
+    ]) as unknown as Parameters<typeof route.handler>[0];
+    Object.assign(req, {
+      method: "POST",
+      url: "/plugins/session-search/show-session",
+      headers: {
+        accept: "application/json",
+        "content-type": "application/json",
+        "x-openclaw-plugin-ui-session-key": "agent:main:active",
+        "x-openclaw-plugin-ui-context-tokens": "10000",
+      },
+    });
+    const res = {
+      statusCode: 0,
+      setHeader: vi.fn(),
+      end: vi.fn((chunk: string) => {
+        chunks.push(chunk);
+      }),
+    };
+
+    await route.handler(req, res as never);
+
+    expect(res.statusCode).toBe(200);
+    const payload = JSON.parse(chunks.join("")) as { sessionKey?: string; resumed?: boolean };
+    expect(payload.resumed).toBe(true);
+    const hookResult = (await beforePromptBuildHandlers[0]?.(
+      { prompt: "continue", messages: [] },
+      { sessionKey: payload.sessionKey ?? "" },
+    )) as { prependContext?: string } | undefined;
+    expect(hookResult?.prependContext).toContain("Transcript messages included: 2");
+    expect(hookResult?.prependContext).toContain("User resume message");
+    expect(hookResult?.prependContext).toContain("Second user resume message");
+    expect(hookResult?.prependContext).not.toContain("Assistant resume message should be filtered");
+    expect(hookResult?.prependContext).not.toContain("Tool resume message should be filtered");
     await fs.rm(dir, { recursive: true, force: true });
   });
 
