@@ -4,7 +4,7 @@ Session Search is an OpenClaw Control UI plugin for finding, inspecting, injecti
 
 It is intended for OpenClaw builds that support Plugin UI Entry Points, gateway-authenticated plugin HTTP routes, session transcript access, and the `before_prompt_build` plugin hook.
 
-Build and focused tests passed on OpenClaw `2026.5.7` at `Ittiz/openclaw@1a68b5a09e` on Windows. Live Control UI injection was validated on OpenClaw `2026.5.10-beta.1` on MLserver. Newer compatible builds should work when they preserve the required host APIs below.
+The current example targets OpenClaw builds containing the Plugin UI Entry Points dispatch fix from `openclaw/openclaw#80388`, verified against `4e36e35e2205382b8ee73df4ed0ef80bf53435e8`. Older compatible builds should work only when they preserve the required host APIs below.
 
 ## Installation
 
@@ -27,7 +27,8 @@ The plugin is loaded from `extensions/session-search/index.ts` and declares its 
 ## Requirements
 
 - An OpenClaw build with Plugin UI Entry Points support.
-- Plugin SDK support for `registerControlUiEntryPoint`.
+- Plugin SDK support for `api.session.controls.registerControlUiEntryPoint`.
+- Gateway dispatch registration for `plugins.uiEntryPoints` and `plugins.uiEntryPointLaunch`.
 - Gateway-authenticated plugin HTTP routes.
 - The `before_prompt_build` plugin hook.
 - Session store and transcript runtime APIs.
@@ -75,21 +76,23 @@ These injection paths are intentionally transcript-focused:
 ## Security Model
 
 - Plugin pages are served through gateway-authenticated routes.
-- The Control UI entry point requires `operator.read`.
+- The Control UI entry point opens in-app and requires `operator.read`.
+- Entry-point launch tokens and follow-up iframe sessions are scoped to the entry point's `requiredScopes`.
 - Browser requests send session keys and message indexes; transcript text is reread on the server.
 - Resume and injection payloads are assembled server-side.
 - The plugin does not call external services.
 
 ## Compatibility
 
-Compatibility proof as of May 12, 2026:
+Compatibility proof as of May 29, 2026:
 
-- Build and focused Session Search tests passed on OpenClaw `2026.5.7` at `Ittiz/openclaw@1a68b5a09e` on Windows.
-- Live Control UI session injection passed on OpenClaw `2026.5.10-beta.1` on MLserver.
+- Focused Session Search tests passed after installing this plugin into the `openclaw/openclaw#80388` proof worktree at `4e36e35e2205382b8ee73df4ed0ef80bf53435e8`.
+- The host worktree build passed with the Plugin UI Entry Points dispatch fix in place.
 
 This plugin is designed as an OpenClaw workspace/bundled extension. It imports OpenClaw plugin runtime helpers and expects a compatible OpenClaw build with:
 
-- `registerControlUiEntryPoint`
+- `api.session.controls.registerControlUiEntryPoint`
+- `plugins.uiEntryPoints` and `plugins.uiEntryPointLaunch` registered through the gateway core dispatch map
 - gateway-authenticated plugin HTTP routes
 - `before_prompt_build`
 - session store and transcript runtime APIs

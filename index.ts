@@ -12,11 +12,12 @@ export function registerSessionSearchPlugin(api: OpenClawPluginApi): void {
     return prependContext ? { prependContext } : undefined;
   });
 
-  api.registerControlUiEntryPoint({
+  api.session.controls.registerControlUiEntryPoint({
     id: "session-search",
     surface: "app-nav",
     label: "Session Search",
     path: SESSION_SEARCH_ENTRY_PATH,
+    openMode: "in-app",
     description: "Search, inspect, inject, and resume previous OpenClaw sessions.",
     requiredScopes: ["operator.read"],
   });

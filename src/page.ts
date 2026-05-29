@@ -3,7 +3,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { resolveAgentWorkspaceDir } from "../../../src/agents/agent-scope.js";
 import { resolveBootstrapFilesForRun } from "../../../src/agents/bootstrap-files.js";
-import { buildBootstrapContextFiles } from "../../../src/agents/pi-embedded-helpers.js";
+import { buildBootstrapContextFiles } from "../../../src/agents/embedded-agent-helpers.js";
 import { resolveSessionStoreEntry } from "../../../src/config/sessions/store-entry.js";
 import { appendSessionTranscriptMessage } from "../../../src/config/sessions/transcript-append.js";
 import type { OpenClawConfig } from "../../../src/config/types.js";
@@ -2583,7 +2583,9 @@ async function handleShowSessionToAgent(params: {
     ? undefined
     : parseIncludedMessageRoles(body.includedMessageRoles);
   const filteredMessages = includedMessageRoleSet
-    ? allMessages.filter((message) => includedMessageRoleSet.has(normalizeMessageRole(message.role)))
+    ? allMessages.filter((message) =>
+        includedMessageRoleSet.has(normalizeMessageRole(message.role)),
+      )
     : allMessages;
   const messages = selectedMessageIndexSet
     ? allMessages.filter((message) => selectedMessageIndexSet.has(message.index))

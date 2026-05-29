@@ -34,6 +34,7 @@ describe("session-search plugin", () => {
       surface: "app-nav",
       label: "Session Search",
       path: "/plugins/session-search/",
+      openMode: "in-app",
       description: "Search, inspect, inject, and resume previous OpenClaw sessions.",
       requiredScopes: ["operator.read"],
     });
@@ -205,7 +206,9 @@ describe("session-search plugin", () => {
     expect(serializedItems).toContain("Find old deployment notes");
     expect(serializedItems).toContain("Older transcript outside sessions json");
     expect(serializedItems).toContain("Deleted archived transcript still searchable");
-    expect(serializedItems).toContain("/plugins/session-search/session/main");
+    expect(payload.items).toEqual(
+      expect.arrayContaining([expect.objectContaining({ key: "main", sessionId: "sess-main" })]),
+    );
     await fs.rm(dir, { recursive: true, force: true });
   });
 
@@ -672,7 +675,9 @@ describe("session-search plugin", () => {
       { sessionKey: "agent:main:active" },
     )) as { prependContext?: string } | undefined;
     expect(hookResult?.prependContext).toContain("Hidden but selected assistant message");
-    expect(hookResult?.prependContext).not.toContain("Visible user message");
+    expect(hookResult?.prependContext).not.toContain(
+      '<message index="1" source_index="0" role="user"',
+    );
     expect(JSON.parse(chunks.join(""))).toMatchObject({
       ok: true,
       injected: true,
