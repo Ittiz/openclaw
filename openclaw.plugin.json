@@ -1,7 +1,7 @@
 {
   "id": "session-search",
   "name": "Session Search",
-  "description": "Search, inspect, inject, and resume prior OpenClaw sessions from the Control UI. Updated for the Plugin UI Entry Points dispatch fix in openclaw/openclaw#80388.",
+  "description": "Search, inspect, inject, and resume prior OpenClaw sessions from the Control UI. Bundled for local plugin installs and updated for openclaw/openclaw#80388.",
   "activation": {
     "onStartup": true
   },

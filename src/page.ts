@@ -39,6 +39,7 @@ type SessionEntryLike = {
 
 type SessionSummary = {
   key: string;
+  agentId: string;
   sessionId: string;
   updatedAt: number;
   startedAt?: number;
@@ -63,6 +64,7 @@ type SessionSummary = {
 type SessionSummaryCandidate =
   | {
       kind: "store";
+      agentId: string;
       key: string;
       entry: SessionEntryLike;
       sessionId: string;
@@ -72,6 +74,7 @@ type SessionSummaryCandidate =
     }
   | {
       kind: "transcript";
+      agentId: string;
       key: string;
       sessionId: string;
       status: string;
@@ -88,6 +91,19 @@ type TranscriptMessage = {
 };
 
 type NormalizedMessageRole = "user" | "assistant" | "tool" | "system" | "other";
+const DEFAULT_SEARCH_MESSAGE_ROLES: NormalizedMessageRole[] = [
+  "user",
+  "assistant",
+  "tool",
+  "system",
+  "other",
+];
+type SearchMatchMode = "exact" | "all" | "any";
+type SessionSummaryMode = "preview" | "search";
+type SessionSearchAgentOption = {
+  id: string;
+  label: string;
+};
 
 type SessionSearchPageParams = {
   api: OpenClawPluginApi;
@@ -99,8 +115,9 @@ type SessionSearchPageParams = {
 const DEFAULT_AGENT_ID = "main";
 const DEFAULT_BATCH_LIMIT = 25;
 const MAX_LIMIT = 200;
-const MAX_TRANSCRIPT_BYTES_FOR_SEARCH = 512 * 1024;
-const MAX_DETAIL_MESSAGES = 120;
+const MAX_SEARCH_SCAN_PER_REQUEST = 50;
+const SESSION_LIST_PREVIEW_BYTES = 1024 * 1024;
+const SESSION_LIST_PREVIEW_MESSAGES = 40;
 const MAX_INJECTION_CHARS_PER_CHUNK = 30 * 1024;
 const MAX_INJECTION_CHUNKS = 32;
 const RESUME_BOOTSTRAP_FILE_MAX_CHARS = 6_000;
@@ -124,6 +141,29 @@ function escapeHtml(value: string): string {
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&#39;");
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function renderInlineMarkdown(value: string): string {
+  const codeSpans: string[] = [];
+  let html = escapeHtml(value).replace(/`([^`]+)`/g, (_match, code: string) => {
+    const token = `\u0000CODE${codeSpans.length}\u0000`;
+    codeSpans.push(`<code>${code}</code>`);
+    return token;
+  });
+  html = html.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+  for (const [index, codeHtml] of codeSpans.entries()) {
+    html = html.replace(new RegExp(escapeRegExp(`\u0000CODE${index}\u0000`), "g"), codeHtml);
+  }
+  return html;
+}
+
+function renderMessageTextHtml(value: string): string {
+  const paragraphs = value.trim().split(/\n{2,}/);
+  return paragraphs.map((paragraph) => `<p>${renderInlineMarkdown(paragraph)}</p>`).join("");
 }
 
 function stringValue(value: unknown): string {
@@ -271,6 +311,45 @@ function truncate(value: string, maxLength: number): string {
   return `${normalized.slice(0, Math.max(0, maxLength - 1)).trimEnd()}…`;
 }
 
+function splitSearchWords(value: string): string[] {
+  return compactWhitespace(value)
+    .toLowerCase()
+    .split(" ")
+    .map((word) => word.trim())
+    .filter(Boolean);
+}
+
+function parseSearchMatchMode(value: string | null): SearchMatchMode {
+  if (value === "all" || value === "any") {
+    return value;
+  }
+  return "exact";
+}
+
+function excerptAroundMatch(
+  text: string,
+  matchIndex: number,
+  matchLength: number,
+  maxLength: number,
+): string {
+  const normalized = compactWhitespace(text);
+  if (normalized.length <= maxLength) {
+    return normalized;
+  }
+  const safeMatchIndex = Math.max(0, Math.min(matchIndex, normalized.length));
+  const safeMatchLength = Math.max(1, matchLength);
+  const contextLength = Math.max(0, maxLength - safeMatchLength - 2);
+  const before = Math.floor(contextLength / 2);
+  const after = contextLength - before;
+  const rawStart = safeMatchIndex - before;
+  const rawEnd = safeMatchIndex + safeMatchLength + after;
+  const start = Math.max(0, Math.min(rawStart, normalized.length));
+  const end = Math.min(normalized.length, Math.max(rawEnd, start));
+  const prefix = start > 0 ? "…" : "";
+  const suffix = end < normalized.length ? "…" : "";
+  return `${prefix}${normalized.slice(start, end).trim()}${suffix}`;
+}
+
 function extractText(value: unknown): string {
   if (typeof value === "string") {
     return value;
@@ -303,7 +382,7 @@ function parseTranscriptMessage(line: string): TranscriptMessage | undefined {
   if (!role) {
     return undefined;
   }
-  const text = compactWhitespace(extractText(record.content));
+  const text = extractText(record.content).trim();
   if (!text) {
     return undefined;
   }
@@ -357,6 +436,19 @@ async function readTranscriptMessages(
   return opts.maxMessages ? messages.slice(-opts.maxMessages) : messages;
 }
 
+function transcriptReadOptionsForSummaryMode(mode: SessionSummaryMode): {
+  maxBytes?: number;
+  maxMessages?: number;
+} {
+  if (mode === "search") {
+    return {};
+  }
+  return {
+    maxBytes: SESSION_LIST_PREVIEW_BYTES,
+    maxMessages: SESSION_LIST_PREVIEW_MESSAGES,
+  };
+}
+
 function formatSessionForAgent(params: {
   session: SessionSummary;
   messages: TranscriptMessage[];
@@ -375,7 +467,7 @@ function formatSessionForAgent(params: {
     "",
     `Source session key: ${params.session.key}`,
     `Source session id: ${params.session.sessionId}`,
-    `Title: ${params.session.title}`,
+    ...(params.selectedOnly ? [] : [`Title: ${params.session.title}`]),
     `Updated: ${formatIsoTimestamp(params.session.updatedAt)}`,
     `Channel: ${params.session.channel}`,
     `Status: ${params.session.status}`,
@@ -797,6 +889,99 @@ function labelForMessageRole(role: string): string {
   return role || "Message";
 }
 
+function defaultSearchMessageRoleSet(): Set<NormalizedMessageRole> {
+  return new Set(DEFAULT_SEARCH_MESSAGE_ROLES);
+}
+
+function parseSearchMessageRoles(value: string | null): Set<NormalizedMessageRole> {
+  if (value === null) {
+    return defaultSearchMessageRoleSet();
+  }
+  const roles = new Set<NormalizedMessageRole>();
+  for (const rawRole of value.split(",")) {
+    const role = rawRole.trim();
+    if (!role) {
+      continue;
+    }
+    roles.add(normalizeMessageRole(role));
+  }
+  return roles;
+}
+
+function filterMessagesByRole(
+  messages: TranscriptMessage[],
+  includedRoles: Set<NormalizedMessageRole>,
+): TranscriptMessage[] {
+  return messages.filter((message) => includedRoles.has(normalizeMessageRole(message.role)));
+}
+
+function findSearchMatchIndex(
+  searchableText: string,
+  normalizedQuery: string,
+  searchWords: string[],
+  searchMode: SearchMatchMode,
+): { index: number; length: number } | undefined {
+  if (!normalizedQuery) {
+    return undefined;
+  }
+  if (searchMode === "exact") {
+    const index = searchableText.indexOf(normalizedQuery);
+    return index >= 0 ? { index, length: normalizedQuery.length } : undefined;
+  }
+  if (searchWords.length === 0) {
+    return undefined;
+  }
+  const matches = searchWords
+    .map((word) => ({ word, index: searchableText.indexOf(word) }))
+    .filter((match) => match.index >= 0);
+  if (searchMode === "all" && matches.length !== searchWords.length) {
+    return undefined;
+  }
+  const firstMatch = matches.toSorted((a, b) => a.index - b.index)[0];
+  return firstMatch ? { index: firstMatch.index, length: firstMatch.word.length } : undefined;
+}
+
+function matchesSearchQuery(params: {
+  searchableText: string;
+  normalizedQuery: string;
+  searchMode: SearchMatchMode;
+  searchWords: string[];
+}): boolean {
+  return Boolean(
+    findSearchMatchIndex(
+      params.searchableText,
+      params.normalizedQuery,
+      params.searchWords,
+      params.searchMode,
+    ),
+  );
+}
+
+function createSearchExcerpt(params: {
+  messages: TranscriptMessage[];
+  normalizedQuery: string;
+  searchMode: SearchMatchMode;
+  searchWords: string[];
+  maxLength: number;
+}): string | undefined {
+  if (!params.normalizedQuery) {
+    return undefined;
+  }
+  for (const message of params.messages) {
+    const text = compactWhitespace(message.text);
+    const match = findSearchMatchIndex(
+      text.toLowerCase(),
+      params.normalizedQuery,
+      params.searchWords,
+      params.searchMode,
+    );
+    if (match) {
+      return excerptAroundMatch(text, match.index, match.length, params.maxLength);
+    }
+  }
+  return undefined;
+}
+
 function parseSearchableTranscriptFileName(
   fileName: string,
 ): { sessionId: string; status: string } | undefined {
@@ -826,19 +1011,10 @@ function createSearchableText(params: {
   entry?: SessionEntryLike;
   messages: TranscriptMessage[];
 }): string {
-  return [
-    params.key,
-    params.sessionId,
-    params.title,
-    params.channel,
-    params.status,
-    params.model,
-    stringValue(params.entry?.origin?.from),
-    stringValue(params.entry?.origin?.to),
-    params.messages.map((message) => message.text).join("\n"),
-  ]
+  return params.messages
+    .map((message) => compactWhitespace(message.text))
     .filter(Boolean)
-    .join("\n")
+    .join(" ")
     .toLowerCase();
 }
 
@@ -869,9 +1045,7 @@ async function loadDiscoveredTranscriptSummaries(params: {
     } catch {
       continue;
     }
-    const messages = await readTranscriptMessages(transcriptPath, {
-      maxBytes: MAX_TRANSCRIPT_BYTES_FOR_SEARCH,
-    });
+    const messages = await readTranscriptMessages(transcriptPath);
     const sessionId = parsedFile.sessionId;
     const key = `agent:${DEFAULT_AGENT_ID}:${sessionId}`;
     const title = titleForSession(key, { sessionId }, messages);
@@ -905,16 +1079,56 @@ async function loadDiscoveredTranscriptSummaries(params: {
 }
 void loadDiscoveredTranscriptSummaries;
 
-function resolveSessionStorePath(api: OpenClawPluginApi): string {
+function resolveSearchAgentIds(config: OpenClawConfig): string[] {
+  return resolveSearchAgentOptions(config).map((option) => option.id);
+}
+
+function resolveSearchAgentOptions(config: OpenClawConfig): SessionSearchAgentOption[] {
+  const agentsById = new Map<string, SessionSearchAgentOption>([
+    [DEFAULT_AGENT_ID, { id: DEFAULT_AGENT_ID, label: DEFAULT_AGENT_ID }],
+  ]);
+  const agents = config.agents?.list;
+  if (Array.isArray(agents)) {
+    for (const agent of agents) {
+      if (!agent || typeof agent !== "object") {
+        continue;
+      }
+      const id = stringValue((agent as { id?: unknown }).id);
+      if (id) {
+        const label =
+          stringValue((agent as { name?: unknown }).name) ||
+          stringValue((agent as { title?: unknown }).title) ||
+          id;
+        agentsById.set(id, { id, label });
+      }
+    }
+  }
+  return [...agentsById.values()];
+}
+
+function resolveSelectedSearchAgentId(
+  config: OpenClawConfig,
+  requestedAgentId: string | undefined,
+): string | undefined {
+  const normalized = requestedAgentId?.trim();
+  if (!normalized || normalized === "all") {
+    return undefined;
+  }
+  const validAgentIds = new Set(resolveSearchAgentIds(config));
+  return validAgentIds.has(normalized) ? normalized : undefined;
+}
+
+function resolveSessionStorePath(api: OpenClawPluginApi, agentId = DEFAULT_AGENT_ID): string {
   const cfg = api.runtime.config.current();
   return api.runtime.agent.session.resolveStorePath(cfg.session?.store, {
-    agentId: DEFAULT_AGENT_ID,
+    agentId,
   });
 }
 
 async function resolveSessionSummaryCandidates(params: {
   api: OpenClawPluginApi;
   storePath: string;
+  agentId: string;
 }): Promise<SessionSummaryCandidate[]> {
   const sessionRuntime = params.api.runtime.agent.session;
   const sessionsDir = path.dirname(params.storePath);
@@ -943,6 +1157,7 @@ async function resolveSessionSummaryCandidates(params: {
     }
     candidates.push({
       kind: "store",
+      agentId: params.agentId,
       key,
       entry,
       sessionId,
@@ -977,7 +1192,8 @@ async function resolveSessionSummaryCandidates(params: {
     const sessionId = parsedFile.sessionId;
     candidates.push({
       kind: "transcript",
-      key: `agent:${DEFAULT_AGENT_ID}:${sessionId}`,
+      agentId: params.agentId,
+      key: `agent:${params.agentId}:${sessionId}`,
       sessionId,
       status: parsedFile.status,
       transcriptPath,
@@ -990,19 +1206,73 @@ async function resolveSessionSummaryCandidates(params: {
   return candidates;
 }
 
+async function resolveAllSessionSummaryCandidates(params: {
+  api: OpenClawPluginApi;
+  agentId?: string;
+}): Promise<{ storePath: string; candidates: SessionSummaryCandidate[] }> {
+  const cfg = params.api.runtime.config.current();
+  const allAgentIds = resolveSearchAgentIds(cfg);
+  const agentIds =
+    params.agentId && allAgentIds.includes(params.agentId) ? [params.agentId] : allAgentIds;
+  const candidates: SessionSummaryCandidate[] = [];
+  let primaryStorePath = "";
+  const seenStorePaths = new Set<string>();
+  for (const agentId of agentIds) {
+    const storePath = resolveSessionStorePath(params.api, agentId);
+    if (agentId === DEFAULT_AGENT_ID) {
+      primaryStorePath = storePath;
+    }
+    const resolvedStorePath = path.resolve(storePath);
+    if (seenStorePaths.has(resolvedStorePath)) {
+      continue;
+    }
+    seenStorePaths.add(resolvedStorePath);
+    candidates.push(
+      ...(await resolveSessionSummaryCandidates({
+        api: params.api,
+        storePath,
+        agentId,
+      })),
+    );
+  }
+  candidates.sort((a, b) => b.updatedAt - a.updatedAt || a.order - b.order);
+  return { storePath: primaryStorePath || resolveSessionStorePath(params.api), candidates };
+}
+
 async function summarizeSessionCandidate(
   candidate: SessionSummaryCandidate,
+  opts: {
+    includedMessageRoles?: Set<NormalizedMessageRole>;
+    mode?: SessionSummaryMode;
+    normalizedQuery?: string;
+    searchMode?: SearchMatchMode;
+    searchWords?: string[];
+  } = {},
 ): Promise<SessionSummary> {
+  const mode = opts.mode ?? "search";
+  const includedMessageRoles = opts.includedMessageRoles ?? defaultSearchMessageRoleSet();
+  const normalizedQuery = opts.normalizedQuery ?? "";
+  const searchMode = opts.searchMode ?? "exact";
+  const searchWords = opts.searchWords ?? splitSearchWords(normalizedQuery);
+  const transcriptReadOptions = transcriptReadOptionsForSummaryMode(mode);
   if (candidate.kind === "transcript") {
-    const messages = await readTranscriptMessages(candidate.transcriptPath, {
-      maxBytes: MAX_TRANSCRIPT_BYTES_FOR_SEARCH,
-    });
+    const messages = await readTranscriptMessages(candidate.transcriptPath, transcriptReadOptions);
+    const searchableMessages = filterMessagesByRole(messages, includedMessageRoles);
     const title = titleForSession(candidate.key, { sessionId: candidate.sessionId }, messages);
     const channel = "transcript";
     const model = "unknown";
     const startedAt = messages.find((message) => message.timestamp !== undefined)?.timestamp;
+    const excerpt =
+      createSearchExcerpt({
+        messages: searchableMessages,
+        normalizedQuery,
+        searchMode,
+        searchWords,
+        maxLength: 220,
+      }) ?? truncate(searchableMessages.at(-1)?.text ?? messages.at(-1)?.text ?? "", 220);
     return {
       key: candidate.key,
+      agentId: candidate.agentId,
       sessionId: candidate.sessionId,
       updatedAt: candidate.updatedAt,
       ...(startedAt !== undefined ? { startedAt } : {}),
@@ -1011,7 +1281,7 @@ async function summarizeSessionCandidate(
       status: candidate.status,
       model,
       transcriptPath: candidate.transcriptPath,
-      excerpt: truncate(messages.at(-1)?.text ?? "", 220),
+      excerpt,
       searchableText: createSearchableText({
         key: candidate.key,
         sessionId: candidate.sessionId,
@@ -1019,15 +1289,21 @@ async function summarizeSessionCandidate(
         channel,
         status: candidate.status,
         model,
-        messages,
+        messages: searchableMessages,
       }),
     };
   }
-  const messages = await readTranscriptMessages(candidate.transcriptPath, {
-    maxBytes: MAX_TRANSCRIPT_BYTES_FOR_SEARCH,
-  });
+  const messages = await readTranscriptMessages(candidate.transcriptPath, transcriptReadOptions);
+  const searchableMessages = filterMessagesByRole(messages, includedMessageRoles);
   const entry = candidate.entry;
-  const excerpt = truncate(messages.at(-1)?.text ?? "", 220);
+  const excerpt =
+    createSearchExcerpt({
+      messages: searchableMessages,
+      normalizedQuery,
+      searchMode,
+      searchWords,
+      maxLength: 220,
+    }) ?? truncate(searchableMessages.at(-1)?.text ?? messages.at(-1)?.text ?? "", 220);
   const title = titleForSession(candidate.key, entry, messages);
   const channel = channelForSession(entry);
   const status = stringValue(entry.status) || "active";
@@ -1040,10 +1316,11 @@ async function summarizeSessionCandidate(
     status,
     model,
     entry,
-    messages,
+    messages: searchableMessages,
   });
   const summary: SessionSummary = {
     key: candidate.key,
+    agentId: candidate.agentId,
     sessionId: candidate.sessionId,
     updatedAt: candidate.updatedAt,
     title,
@@ -1083,14 +1360,16 @@ async function summarizeSessionCandidate(
   return summary;
 }
 
-async function loadSessionSummaries(api: OpenClawPluginApi): Promise<{
+async function loadSessionSummaries(
+  api: OpenClawPluginApi,
+  opts: { mode?: SessionSummaryMode } = {},
+): Promise<{
   storePath: string;
   sessions: SessionSummary[];
 }> {
-  const storePath = resolveSessionStorePath(api);
-  const candidates = await resolveSessionSummaryCandidates({ api, storePath });
+  const { storePath, candidates } = await resolveAllSessionSummaryCandidates({ api });
   const sessions = await Promise.all(
-    candidates.map((candidate) => summarizeSessionCandidate(candidate)),
+    candidates.map((candidate) => summarizeSessionCandidate(candidate, { mode: opts.mode })),
   );
   sessions.sort((a, b) => b.updatedAt - a.updatedAt || a.key.localeCompare(b.key));
   return { storePath, sessions };
@@ -1099,6 +1378,8 @@ async function loadSessionSummaries(api: OpenClawPluginApi): Promise<{
 function serializeSessionSummary(session: SessionSummary): Record<string, unknown> {
   return {
     key: session.key,
+    agentId: session.agentId,
+    href: sessionDetailLink(session.key),
     sessionId: session.sessionId,
     updatedAt: session.updatedAt,
     startedAt: session.startedAt,
@@ -1127,14 +1408,13 @@ async function loadSessionDetailPayload(params: {
   api: OpenClawPluginApi;
   key: string;
 }): Promise<Record<string, unknown> | undefined> {
-  const data = await loadSessionSummaries(params.api);
-  const session = data.sessions.find((entry) => entry.key === params.key);
-  if (!session) {
+  const { candidates } = await resolveAllSessionSummaryCandidates({ api: params.api });
+  const candidate = candidates.find((entry) => entry.key === params.key);
+  if (!candidate) {
     return undefined;
   }
-  const messages = await readTranscriptMessages(session.transcriptPath, {
-    maxMessages: MAX_DETAIL_MESSAGES,
-  });
+  const session = await summarizeSessionCandidate(candidate, { mode: "search" });
+  const messages = await readTranscriptMessages(session.transcriptPath);
   return {
     ok: true,
     session: serializeSessionSummary(session),
@@ -1144,26 +1424,53 @@ async function loadSessionDetailPayload(params: {
 
 async function loadSessionSummaryBatch(params: {
   api: OpenClawPluginApi;
+  agentId?: string;
+  includedMessageRoles: Set<NormalizedMessageRole>;
   query: string;
+  searchMode: SearchMatchMode;
   offset: number;
   limit: number;
+  fullTextSearch: boolean;
 }): Promise<Record<string, unknown>> {
-  const storePath = resolveSessionStorePath(params.api);
-  const candidates = await resolveSessionSummaryCandidates({ api: params.api, storePath });
-  const normalizedQuery = params.query.trim().toLowerCase();
+  const { storePath, candidates } = await resolveAllSessionSummaryCandidates({
+    api: params.api,
+    agentId: params.agentId,
+  });
+  const normalizedQuery = compactWhitespace(params.query).toLowerCase();
+  const searchWords = splitSearchWords(params.query);
+  const summaryMode: SessionSummaryMode =
+    normalizedQuery && params.fullTextSearch ? "search" : "preview";
   const items: Record<string, unknown>[] = [];
   let nextOffset = Math.min(params.offset, candidates.length);
-  const maxScanned = normalizedQuery ? Math.max(params.limit * 4, 100) : params.limit;
+  const maxScanned = normalizedQuery
+    ? params.fullTextSearch
+      ? MAX_SEARCH_SCAN_PER_REQUEST
+      : Math.max(params.limit * 2, 50)
+    : params.limit;
   let scannedThisBatch = 0;
   while (
     nextOffset < candidates.length &&
     items.length < params.limit &&
     scannedThisBatch < maxScanned
   ) {
-    const summary = await summarizeSessionCandidate(candidates[nextOffset]);
+    const summary = await summarizeSessionCandidate(candidates[nextOffset], {
+      includedMessageRoles: params.includedMessageRoles,
+      mode: summaryMode,
+      normalizedQuery,
+      searchMode: params.searchMode,
+      searchWords,
+    });
     nextOffset += 1;
     scannedThisBatch += 1;
-    if (!normalizedQuery || summary.searchableText.includes(normalizedQuery)) {
+    if (
+      !normalizedQuery ||
+      matchesSearchQuery({
+        searchableText: summary.searchableText,
+        normalizedQuery,
+        searchMode: params.searchMode,
+        searchWords,
+      })
+    ) {
       items.push(serializeSessionSummary(summary));
     }
   }
@@ -1232,11 +1539,11 @@ function renderShell(params: {
       }
       form {
         display: grid;
-        grid-template-columns: minmax(0, 1fr) auto;
+        grid-template-columns: minmax(0, 1fr) minmax(150px, 220px) auto;
         gap: 8px;
         margin: 0 0 18px;
       }
-      input, button {
+      input, select, button {
         font: inherit;
         border: 1px solid color-mix(in srgb, CanvasText 22%, transparent);
         background: Canvas;
@@ -1247,6 +1554,11 @@ function renderShell(params: {
       button {
         cursor: pointer;
         background: color-mix(in srgb, CanvasText 9%, Canvas);
+      }
+      @media (max-width: 720px) {
+        form {
+          grid-template-columns: 1fr;
+        }
       }
       .toolbar {
         display: flex;
@@ -1391,18 +1703,25 @@ function renderShell(params: {
         gap: 14px;
         margin-top: 14px;
       }
-      .message {
-        position: relative;
+      .chat-group {
         display: flex;
         gap: 10px;
         align-items: flex-start;
+        margin: 0 16px 0 4px;
+      }
+      .chat-group.user {
+        flex-direction: row-reverse;
+        justify-content: flex-start;
+      }
+      .message {
+        position: relative;
       }
       .message[data-agent-selected="true"] {
         isolation: isolate;
       }
       .message[data-agent-selected="true"]::before {
         position: absolute;
-        inset: -5px;
+        inset: -6px;
         z-index: -1;
         border: 2px solid rgb(217 48 37 / 62%);
         border-radius: 12px;
@@ -1410,53 +1729,114 @@ function renderShell(params: {
         content: "";
         pointer-events: none;
       }
-      .message--user {
-        flex-direction: row-reverse;
-      }
-      .message-avatar {
+      .chat-avatar {
         display: grid;
         place-items: center;
-        flex: 0 0 30px;
-        width: 30px;
-        height: 30px;
-        border-radius: 999px;
+        flex: 0 0 36px;
+        width: 36px;
+        height: 36px;
+        align-self: flex-end;
+        margin-bottom: 4px;
+        border-radius: 8px;
         border: 1px solid color-mix(in srgb, CanvasText 16%, transparent);
         background: color-mix(in srgb, CanvasText 7%, Canvas);
         color: color-mix(in srgb, CanvasText 72%, transparent);
-        font-size: 11px;
-        font-weight: 800;
+        font-size: 13px;
+        font-weight: 700;
       }
-      .message--user .message-avatar {
+      .chat-avatar.user {
         border-color: color-mix(in srgb, LinkText 35%, transparent);
-        background: color-mix(in srgb, LinkText 18%, Canvas);
+        background: color-mix(in srgb, LinkText 14%, Canvas);
         color: color-mix(in srgb, LinkText 72%, CanvasText);
       }
-      .message--tool .message-avatar,
-      .message--other .message-avatar {
-        border-style: dashed;
+      .chat-avatar.tool,
+      .chat-avatar.system,
+      .chat-avatar.other {
+        background: color-mix(in srgb, CanvasText 6%, Canvas);
+        color: color-mix(in srgb, CanvasText 58%, transparent);
       }
-      .message-body {
-        display: grid;
-        gap: 5px;
-        max-width: min(1180px, 88%);
+      .chat-group-messages {
+        display: flex;
+        flex: 1 1 auto;
+        flex-direction: column;
+        align-items: flex-start;
+        width: 100%;
+        max-width: min(900px, 68%);
         min-width: 0;
       }
-      .message--user .message-body {
-        justify-items: end;
+      .chat-group.user .chat-group-messages {
+        align-items: flex-end;
       }
-      .message-meta {
+      .chat-group.tool .chat-group-messages,
+      .chat-group.system .chat-group-messages,
+      .chat-group.other .chat-group-messages {
+        max-width: min(980px, calc(100% - 46px));
+      }
+      .chat-bubble {
+        position: relative;
+        display: block;
+        width: auto;
+        max-width: 100%;
+        min-width: 0;
+        padding: 10px 14px;
+        border: 1px solid color-mix(in srgb, CanvasText 15%, transparent);
+        border-radius: 12px;
+        background: color-mix(in srgb, CanvasText 5%, Canvas);
+        overflow-wrap: break-word;
+      }
+      .chat-group.user .chat-bubble {
+        border-color: color-mix(in srgb, LinkText 20%, transparent);
+        background: color-mix(in srgb, LinkText 12%, Canvas);
+      }
+      .chat-group.tool .chat-bubble,
+      .chat-group.system .chat-bubble,
+      .chat-group.other .chat-bubble {
+        width: min(100%, 760px);
+        background: color-mix(in srgb, CanvasText 4%, Canvas);
+      }
+      .chat-text {
+        font-size: 14px;
+        line-height: 1.5;
+        white-space: pre-wrap;
+        word-wrap: break-word;
+        overflow-wrap: break-word;
+      }
+      .chat-text :where(p, ul, ol, pre, blockquote, table) {
+        margin: 0;
+      }
+      .chat-text :where(p + p, p + ul, p + ol, p + pre, p + blockquote) {
+        margin-top: 0.75em;
+      }
+      .chat-text :where(code) {
+        font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+        font-size: 0.9em;
+      }
+      .chat-text :where(pre) {
+        max-width: 100%;
+        padding: 10px 12px;
+        overflow-x: auto;
+        border-radius: 6px;
+        background: color-mix(in srgb, CanvasText 10%, Canvas);
+      }
+      .chat-group-footer {
         display: flex;
         align-items: center;
+        flex-wrap: wrap;
         gap: 8px;
+        row-gap: 5px;
+        margin-top: 6px;
         font-size: 12px;
-        font-weight: 700;
         color: color-mix(in srgb, CanvasText 62%, transparent);
       }
-      .message--user .message-meta {
-        flex-direction: row-reverse;
+      .chat-group.user .chat-group-footer {
+        justify-content: flex-end;
       }
-      .message-time {
-        font-weight: 500;
+      .chat-sender-name {
+        font-weight: 600;
+        color: color-mix(in srgb, CanvasText 60%, transparent);
+      }
+      .chat-group-timestamp {
+        font-size: 11px;
         color: color-mix(in srgb, CanvasText 48%, transparent);
       }
       .message-agent-toggle {
@@ -1472,26 +1852,11 @@ function renderShell(params: {
         border-color: color-mix(in srgb, LinkText 45%, transparent);
         background: color-mix(in srgb, LinkText 18%, Canvas);
       }
-      .message-text {
-        margin: 0;
-        width: fit-content;
-        max-width: 100%;
-        padding: 10px 13px;
-        border: 1px solid color-mix(in srgb, CanvasText 15%, transparent);
-        border-radius: 10px;
-        background: color-mix(in srgb, CanvasText 5%, Canvas);
-        white-space: pre-wrap;
-        overflow-wrap: anywhere;
-      }
-      .message--user .message-text {
-        border-color: color-mix(in srgb, LinkText 20%, transparent);
-        background: color-mix(in srgb, LinkText 12%, Canvas);
-      }
-      .message--tool .message-text,
-      .message--other .message-text {
+      .chat-group.tool .chat-text,
+      .chat-group.system .chat-text,
+      .chat-group.other .chat-text {
         font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
         font-size: 13px;
-        background: color-mix(in srgb, CanvasText 4%, Canvas);
       }
       .selection-bar {
         position: fixed;
@@ -1562,6 +1927,8 @@ function renderShell(params: {
     <iframe name="session-search-action-frame" title="Session Search action result" hidden></iframe>
     <script>
       const searchInput = document.querySelector("[data-session-search]");
+      const searchModeSelect = document.querySelector("[data-search-mode]");
+      const agentSelect = document.querySelector("[data-session-agent]");
       const list = document.querySelector("[data-session-list]");
       let rows = Array.from(document.querySelectorAll("[data-session-row]"));
       const detailHost = document.querySelector("[data-session-detail-host]");
@@ -1583,19 +1950,43 @@ function renderShell(params: {
       const toast = document.querySelector("[data-toast]");
       const count = document.querySelector("[data-session-count]");
       const summary = document.querySelector("[data-session-summary]");
+      const loadMoreButton = document.querySelector("[data-load-more-sessions]");
       const apiSessionsPath = ${serializeForInlineScript(params.apiSessionsPath ?? "")};
       const sessionLoading = document.querySelector("[data-session-loading]");
       const sessionStorePath = document.querySelector("[data-session-store-path]");
-      const apiSessionDetailPath = apiSessionsPath.replace(/\\/api\\/sessions$/, "/api/session");
+      const apiSessionDetailPath = apiSessionsPath.endsWith("/api/sessions")
+        ? apiSessionsPath.slice(0, -"/api/sessions".length) + "/api/session"
+        : "";
       let liveSearchEnabled = true;
       let loadGeneration = 0;
-      let loadedMatches = 0;
+      let loadedMatches = rows.length;
       let scannedSessions = 0;
       let totalCandidates = 0;
+      let nextSessionOffset = 0;
+      let loadingSessions = false;
+      let activeFullTextSearch = true;
       let liveSearchBeforeDetail;
       let currentDetailId;
       let toastTimer;
       let showSessionTimer;
+      let liveSearchTimer;
+      let initialSessionLoadQueued = false;
+      const shouldWaitForPluginBridge = () => {
+        try {
+          return window.parent !== window && !pluginUiBridgePort;
+        } catch {
+          return false;
+        }
+      };
+      const queueInitialSessionLoad = () => {
+        if (!apiSessionsPath || initialSessionLoadQueued) return;
+        initialSessionLoadQueued = true;
+        window.setTimeout(() => {
+          initialSessionLoadQueued = false;
+          if (shouldWaitForPluginBridge()) return;
+          loadSessions({ preserveExisting: rows.length > 0 });
+        }, 0);
+      };
       const showToast = (message) => {
         if (!toast) return;
         toast.textContent = message;
@@ -1613,9 +2004,7 @@ function renderShell(params: {
         if (event.data?.type === "openclaw.pluginUi.connect" && event.ports?.[0]) {
           pluginUiBridgePort = event.ports[0];
           pluginUiBridgePort.start();
-          if (apiSessionsPath && rows.length === 0) {
-            window.setTimeout(loadSessions, 0);
-          }
+          queueInitialSessionLoad();
           return;
         }
         if (event.data?.type !== "openclaw.pluginUi.response") return;
@@ -1669,6 +2058,18 @@ function renderShell(params: {
         getMessageRoleFilters()
           .filter((checkbox) => checkbox.checked)
           .map((checkbox) => checkbox.value);
+      const resetMessageRoleFilters = () => {
+        for (const checkbox of getMessageRoleFilters()) {
+          checkbox.checked = true;
+        }
+      };
+      const getSearchRoleFilters = () =>
+        Array.from(document.querySelectorAll("[data-search-role-filter]"));
+      const checkedSearchRoles = () =>
+        getSearchRoleFilters()
+          .filter((checkbox) => checkbox.checked)
+          .map((checkbox) => checkbox.value);
+      const selectedSearchMode = () => searchModeSelect?.value || "exact";
       const getActiveDetail = () => {
         const hostedDetail = detailHost?.hasAttribute("hidden")
           ? undefined
@@ -1798,6 +2199,39 @@ function renderShell(params: {
           '"': "&quot;",
           "'": "&#39;",
         })[char]);
+      const renderInlineMarkdown = (value) => {
+        const codeSpans = [];
+        const backtick = String.fromCharCode(96);
+        const codeSpanPattern = new RegExp(backtick + "([^" + backtick + "]+)" + backtick, "g");
+        let html = escapeText(value).replace(codeSpanPattern, (_match, code) => {
+          const token = "@@SESSION_SEARCH_CODE_" + String(codeSpans.length) + "@@";
+          codeSpans.push("<code>" + code + "</code>");
+          return token;
+        });
+        const boldParts = html.split("**");
+        if (boldParts.length > 2) {
+          let rebuilt = boldParts[0] ?? "";
+          for (let index = 1; index < boldParts.length; index += 2) {
+            if (index + 1 < boldParts.length) {
+              rebuilt += "<strong>" + boldParts[index] + "</strong>" + boldParts[index + 1];
+            } else {
+              rebuilt += "**" + boldParts[index];
+            }
+          }
+          html = rebuilt;
+        }
+        for (let index = 0; index < codeSpans.length; index += 1) {
+          html = html.split("@@SESSION_SEARCH_CODE_" + String(index) + "@@").join(codeSpans[index]);
+        }
+        return html;
+      };
+      const paragraphBreakPattern = new RegExp(String.fromCharCode(10) + "{2,}");
+      const renderMessageText = (value) =>
+        String(value ?? "")
+          .trim()
+          .split(paragraphBreakPattern)
+          .map((paragraph) => "<p>" + renderInlineMarkdown(paragraph) + "</p>")
+          .join("");
       const formatTime = (value) => {
         if (typeof value !== "number" || !Number.isFinite(value)) return "unknown";
         return new Date(value).toLocaleString();
@@ -1806,7 +2240,7 @@ function renderShell(params: {
         if (count) count.textContent = String(loadedMatches);
         if (summary) {
           const totalText = totalCandidates ? " of " + String(totalCandidates) : "";
-          const statusText = done ? "Showing " : "Loading ";
+          const statusText = loadingSessions ? "Loading " : "Showing ";
           const storeText = sessionStorePath?.textContent
             ? " from <code>" + escapeText(sessionStorePath.textContent) + "</code>"
             : "";
@@ -1820,6 +2254,12 @@ function renderShell(params: {
             storeText +
             ".";
         }
+        if (loadMoreButton) {
+          const hasMore = !done && activeFullTextSearch && nextSessionOffset > 0;
+          loadMoreButton.toggleAttribute("hidden", !hasMore);
+          loadMoreButton.disabled = loadingSessions;
+          loadMoreButton.textContent = loadingSessions ? "Loading..." : "Load more";
+        }
       };
       const renderSessionRow = (session) => {
         const excerpt = session.excerpt
@@ -1830,6 +2270,7 @@ function renderShell(params: {
           '<span class="session-title">' + escapeText(session.title) + "</span>" +
           '<span class="session-fields subtle">' +
           "<span>" + escapeText(formatTime(session.updatedAt)) + "</span>" +
+          "<span>agent " + escapeText(session.agentId || "main") + "</span>" +
           "<span>" + escapeText(session.channel) + "</span>" +
           "<span>" + escapeText(session.status) + "</span>" +
           "<span>" + escapeText(session.model) + "</span>" +
@@ -1876,16 +2317,16 @@ function renderShell(params: {
         const roleLabel = labelForRole(message.role);
         const roleClass = normalizedRole(message.role);
         const avatar = roleLabel.slice(0, 1).toUpperCase();
-        return '<article class="message message--' + escapeText(roleClass) + '" data-message data-message-role="' + escapeText(roleClass) + '" data-message-index="' + escapeText(message.index) + '">' +
-          '<div class="message-avatar" aria-hidden="true">' + escapeText(avatar) + '</div>' +
-          '<div class="message-body">' +
-          '<div class="message-meta">' +
-          '<span>' + escapeText(roleLabel) + '</span>' +
-          '<span class="message-time">' + escapeText(formatTime(message.timestamp)) + '</span>' +
+        return '<article class="chat-group message message--' + escapeText(roleClass) + ' ' + escapeText(roleClass) + '" data-message data-message-role="' + escapeText(roleClass) + '" data-message-index="' + escapeText(message.index) + '">' +
+          '<div class="chat-avatar ' + escapeText(roleClass) + '" aria-hidden="true">' + escapeText(avatar) + '</div>' +
+          '<div class="chat-group-messages">' +
+          '<div class="chat-bubble"><div class="chat-text">' + renderMessageText(message.text) + '</div></div>' +
+          '<div class="chat-group-footer">' +
+          '<span class="chat-sender-name">' + escapeText(roleLabel) + '</span>' +
+          '<span class="chat-group-timestamp">' + escapeText(formatTime(message.timestamp)) + '</span>' +
           '<button class="message-agent-toggle" type="button" data-message-agent-toggle data-message-index="' + escapeText(message.index) + '" aria-pressed="false" title="show agent" aria-label="show agent">👀</button>' +
           '<button class="message-agent-toggle" type="button" data-resume-session-from-here data-message-index="' + escapeText(message.index) + '" title="Resume Session from Here" aria-label="Resume Session from Here">→</button>' +
           '</div>' +
-          '<p class="message-text">' + escapeText(message.text) + '</p>' +
           '</div>' +
           '</article>';
       };
@@ -1919,6 +2360,7 @@ function renderShell(params: {
         if (!sessionKey || !detailHost || !apiSessionDetailPath) return;
         loadGeneration += 1;
         showSessions();
+        resetMessageRoleFilters();
         list?.setAttribute("hidden", "");
         summary?.setAttribute("hidden", "");
         detailHost.removeAttribute("hidden");
@@ -1940,8 +2382,9 @@ function renderShell(params: {
           applyMessageRoleFilters();
           currentDetailId = sessionKey;
           syncToolbarMode();
-        } catch {
-          detailHost.innerHTML = '<p class="subtle">Could not load transcript.</p>';
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          detailHost.innerHTML = '<p class="subtle">Could not load transcript: ' + escapeText(message) + '</p>';
           showToast("Could not load transcript.");
         }
       };
@@ -1950,6 +2393,7 @@ function renderShell(params: {
         loadedMatches = 0;
         scannedSessions = 0;
         totalCandidates = 0;
+        nextSessionOffset = 0;
         if (list) {
           list.innerHTML = '<p class="subtle" data-session-loading>Loading sessions...</p>';
         }
@@ -1963,48 +2407,81 @@ function renderShell(params: {
         rows = Array.from(document.querySelectorAll("[data-session-row]"));
         loadedMatches += items.length;
       };
-      const loadSessions = async () => {
+      const loadSessions = async (options = {}) => {
         if (!apiSessionsPath || !list) return;
-        const generation = ++loadGeneration;
+        const fullTextSearch = options.fullTextSearch !== false;
+        const append = options.append === true;
+        if (loadingSessions && append) return;
+        const preserveExisting = options.preserveExisting === true && !append;
+        const generation = append ? loadGeneration : ++loadGeneration;
         const query = searchInput?.value.trim() ?? "";
-        let offset = 0;
-        resetSessionList();
-        while (generation === loadGeneration) {
-          const searchParams = new URLSearchParams();
-          searchParams.set("offset", String(offset));
-          searchParams.set("limit", "25");
-          if (query) searchParams.set("q", query);
-          let payload;
-          try {
+        const selectedAgent = agentSelect?.value.trim() ?? "";
+        const exhaustive =
+          options.exhaustive === true &&
+          !append &&
+          (query.length > 0 || options.exhaustiveBlank === true);
+        activeFullTextSearch = fullTextSearch;
+        if (!append && !preserveExisting) {
+          resetSessionList();
+        }
+        loadingSessions = true;
+        updateSessionSummary(false);
+        let offset = append ? nextSessionOffset : 0;
+        try {
+          while (generation === loadGeneration) {
+            const searchParams = new URLSearchParams();
+            searchParams.set("offset", String(offset));
+            searchParams.set("limit", "50");
+            if (selectedAgent && selectedAgent !== "all") searchParams.set("agent", selectedAgent);
+            if (query) searchParams.set("q", query);
+            searchParams.set("mode", selectedSearchMode());
+            searchParams.set("roles", checkedSearchRoles().join(","));
+            if (query && !fullTextSearch) searchParams.set("full", "0");
             const response = await pluginUiRequest(apiSessionsPath + "?" + searchParams.toString(), {
               method: "GET",
               headers: { accept: "application/json" },
             });
-            payload = JSON.parse(response.body);
-          } catch {
-            if (generation === loadGeneration) {
-              if (list) list.innerHTML = '<p class="subtle">Could not load sessions.</p>';
-              showToast("Could not load sessions.");
+            const payload = JSON.parse(response.body);
+            if (generation !== loadGeneration) return;
+            if (typeof payload.storePath === "string" && sessionStorePath) {
+              sessionStorePath.textContent = payload.storePath;
             }
-            return;
-          }
-          if (generation !== loadGeneration) return;
-          if (typeof payload.storePath === "string" && sessionStorePath) {
-            sessionStorePath.textContent = payload.storePath;
-          }
-          totalCandidates = Number(payload.totalCandidates) || totalCandidates;
-          scannedSessions = Number(payload.scanned) || scannedSessions;
-          appendSessionRows(Array.isArray(payload.items) ? payload.items : []);
-          updateSessionSummary(Boolean(payload.done));
-          if (payload.done) {
-            if (loadedMatches === 0 && list) {
-              list.innerHTML = '<p class="subtle">No sessions matched.</p>';
+            totalCandidates = Number(payload.totalCandidates) || totalCandidates;
+            scannedSessions = Number(payload.scanned) || scannedSessions;
+            if (preserveExisting) {
+              resetSessionList();
             }
-            return;
+            appendSessionRows(Array.isArray(payload.items) ? payload.items : []);
+            const previousOffset = offset;
+            nextSessionOffset = Number(payload.nextOffset);
+            if (!Number.isFinite(nextSessionOffset) || nextSessionOffset <= previousOffset) {
+              nextSessionOffset = 0;
+            }
+            if (payload.done || nextSessionOffset === 0) {
+              if (loadedMatches === 0 && list) {
+                list.innerHTML = '<p class="subtle">No sessions matched.</p>';
+              }
+              nextSessionOffset = 0;
+              updateSessionSummary(true);
+              return;
+            }
+            updateSessionSummary(false);
+            if (!exhaustive) {
+              return;
+            }
+            offset = nextSessionOffset;
+            await new Promise((resolve) => window.setTimeout(resolve, 0));
           }
-          offset = Number(payload.nextOffset);
-          if (!Number.isFinite(offset) || offset <= scannedSessions - 1) return;
-          await new Promise((resolve) => window.setTimeout(resolve, 0));
+        } catch {
+          if (generation === loadGeneration) {
+            if (!append && list) list.innerHTML = '<p class="subtle">Could not load sessions.</p>';
+            showToast("Could not load sessions.");
+          }
+        } finally {
+          if (generation === loadGeneration) {
+            loadingSessions = false;
+            updateSessionSummary(nextSessionOffset === 0);
+          }
         }
       };
       const applySearch = () => {
@@ -2040,6 +2517,7 @@ function renderShell(params: {
         if (currentDetailId !== selectedDetail.id) {
           clearSelectedMessages();
           currentDetailId = selectedDetail.id;
+          resetMessageRoleFilters();
         }
         if (liveSearchBeforeDetail === undefined) {
           liveSearchBeforeDetail = liveSearchEnabled;
@@ -2054,12 +2532,25 @@ function renderShell(params: {
         syncToolbarMode();
         applyMessageRoleFilters();
       };
-      const runSearch = () => {
+      const runSearch = (options = {}) => {
+        if (liveSearchTimer) {
+          window.clearTimeout(liveSearchTimer);
+          liveSearchTimer = undefined;
+        }
         if (window.location.hash && window.location.hash !== "#sessions") {
           history.replaceState(null, "", "#sessions");
         }
         showSessions();
-        loadSessions();
+        loadSessions(options);
+      };
+      const hasSearchQuery = () => Boolean(searchInput?.value.trim());
+      const scheduleLiveSearch = () => {
+        if (!liveSearchEnabled) return;
+        if (liveSearchTimer) window.clearTimeout(liveSearchTimer);
+        liveSearchTimer = window.setTimeout(() => {
+          liveSearchTimer = undefined;
+          runSearch({ fullTextSearch: true, exhaustive: hasSearchQuery() });
+        }, 450);
       };
       const updateLiveSearchToggle = () => {
         if (!liveSearchToggle) return;
@@ -2076,20 +2567,34 @@ function renderShell(params: {
       };
       searchInput?.form?.addEventListener("submit", (event) => {
         event.preventDefault();
-        runSearch();
+        runSearch({ fullTextSearch: true, exhaustive: true });
       });
       searchInput?.addEventListener("input", () => {
-        if (liveSearchEnabled) runSearch();
+        scheduleLiveSearch();
+      });
+      agentSelect?.addEventListener("change", () => {
+        runSearch({ fullTextSearch: true, exhaustive: hasSearchQuery() });
+      });
+      searchModeSelect?.addEventListener("change", () => {
+        runSearch({ fullTextSearch: true, exhaustive: hasSearchQuery() });
+      });
+      for (const checkbox of getSearchRoleFilters()) {
+        checkbox.addEventListener("change", () => {
+          runSearch({ fullTextSearch: true, exhaustive: hasSearchQuery() });
+        });
+      }
+      loadMoreButton?.addEventListener("click", () => {
+        loadSessions({ fullTextSearch: activeFullTextSearch, append: true });
       });
       liveSearchToggle?.addEventListener("click", () => {
         liveSearchEnabled = !liveSearchEnabled;
         updateLiveSearchToggle();
-        if (liveSearchEnabled) runSearch();
+        if (liveSearchEnabled) scheduleLiveSearch();
       });
       for (const button of clearButtons) {
         button.addEventListener("click", () => {
           if (searchInput) searchInput.value = "";
-          runSearch();
+          runSearch({ fullTextSearch: true, exhaustive: true, exhaustiveBlank: true });
           scrollToSearch();
         });
       }
@@ -2280,9 +2785,9 @@ function renderShell(params: {
       showSelectedDetail();
       updateLiveSearchToggle();
       if (apiSessionsPath) {
-        window.setTimeout(loadSessions, 0);
+        queueInitialSessionLoad();
       } else {
-        applySearch();
+        updateSessionSummary(true);
       }
       syncToolbarMode();
       applyMessageRoleFilters();
@@ -2292,6 +2797,28 @@ function renderShell(params: {
 </html>`;
 }
 
+function renderAgentSearchOptions(params: {
+  agents: SessionSearchAgentOption[];
+  selectedAgentId?: string;
+}): string {
+  const selectedAgentId = params.selectedAgentId ?? "all";
+  const options = [{ id: "all", label: "All agents" }, ...params.agents];
+  return options
+    .map((option) => {
+      const selected = option.id === selectedAgentId ? " selected" : "";
+      return (
+        '<option value="' +
+        escapeHtml(option.id) +
+        '"' +
+        selected +
+        ">" +
+        escapeHtml(option.label) +
+        "</option>"
+      );
+    })
+    .join("");
+}
+
 async function renderListPage(params: {
   pluginName: string;
   pluginVersion?: string;
@@ -2299,21 +2826,33 @@ async function renderListPage(params: {
   storePath: string;
   showSessionActionPath?: string;
   query: string;
+  agentOptions: SessionSearchAgentOption[];
+  selectedAgentId?: string;
   limit?: number;
   sessions: SessionSummary[];
 }): Promise<string> {
+  const sessionRows = params.sessions.length
+    ? params.sessions.map(renderSessionSummaryRow).join("")
+    : '<p class="subtle" data-session-loading>Loading sessions...</p>';
   const body = `
     <form>
       <input data-session-search name="q" value="${escapeHtml(params.query)}" placeholder="Search sessions" autocomplete="off">
+      <select data-session-agent name="agent" aria-label="Agent">
+        ${renderAgentSearchOptions({
+          agents: params.agentOptions,
+          selectedAgentId: params.selectedAgentId,
+        })}
+      </select>
       <button type="submit">Search</button>
     </form>
     ${renderMessageToolbar({ includeSearchClear: true })}
-    <p class="subtle" data-session-summary>Loading <span data-session-count>0</span> matched sessions<span hidden><code data-session-store-path></code></span>.</p>
+    <p class="subtle" data-session-summary>${params.sessions.length ? "Showing" : "Loading"} <span data-session-count>${params.sessions.length}</span> matched sessions<span hidden><code data-session-store-path></code></span>.</p>
     <section class="session-list" id="sessions" data-session-list>
-      <p class="subtle" data-session-loading>Loading sessions...</p>
+      ${sessionRows}
     </section>
     <section data-session-detail-host hidden></section>
     <div class="toolbar toolbar--bottom" data-list-only-control>
+      <button type="button" data-load-more-sessions hidden>Load more</button>
       <button type="button" data-clear-search>Clear search</button>
     </div>`;
   return renderShell({
@@ -2326,18 +2865,78 @@ async function renderListPage(params: {
   });
 }
 
+function renderSessionSummaryRow(session: SessionSummary): string {
+  const excerpt = session.excerpt
+    ? '<p class="excerpt subtle">' + escapeHtml(session.excerpt) + "</p>"
+    : '<p class="excerpt subtle">No transcript preview available.</p>';
+  return (
+    '<section class="session-row session-row--result" data-session-row>' +
+    '<button class="session-row__link" type="button" data-session-detail-link data-session-key="' +
+    escapeHtml(session.key) +
+    '">' +
+    '<span class="session-title">' +
+    escapeHtml(session.title) +
+    "</span>" +
+    '<span class="session-fields subtle">' +
+    "<span>" +
+    escapeHtml(formatTimestamp(session.updatedAt)) +
+    "</span>" +
+    "<span>agent " +
+    escapeHtml(session.agentId) +
+    "</span>" +
+    "<span>" +
+    escapeHtml(session.channel) +
+    "</span>" +
+    "<span>" +
+    escapeHtml(session.status) +
+    "</span>" +
+    "<span>" +
+    escapeHtml(session.model) +
+    "</span>" +
+    "<span><code>" +
+    escapeHtml(session.key) +
+    "</code></span>" +
+    "</span>" +
+    excerpt +
+    "</button>" +
+    '<span class="session-row__actions">' +
+    '<button class="session-row__agent" type="button" data-show-session-agent data-session-key="' +
+    escapeHtml(session.key) +
+    '" title="Show Session to Agent" aria-label="Show Session to Agent">👀</button>' +
+    '<button class="session-row__agent" type="button" data-resume-session data-session-key="' +
+    escapeHtml(session.key) +
+    '" title="Resume Session" aria-label="Resume Session">→</button>' +
+    "</span>" +
+    "</section>"
+  );
+}
+
 function renderMessageToolbar(params: { includeSearchClear?: boolean } = {}): string {
   return `<div class="toolbar">
       <span class="toolbar__left">
+        <span class="message-filter-controls" data-list-only-control>
+          <span class="message-filter-controls__label">Match:</span>
+          <select data-search-mode aria-label="Search match mode">
+            <option value="exact" selected>Exact phrase</option>
+            <option value="all">All words</option>
+            <option value="any">Any words</option>
+          </select>
+          <span class="message-filter-controls__label">Search In:</span>
+          <label class="search-filter"><input type="checkbox" data-search-role-filter value="assistant" checked> Assistant</label>
+          <label class="search-filter"><input type="checkbox" data-search-role-filter value="user" checked> User</label>
+          <label class="search-filter"><input type="checkbox" data-search-role-filter value="tool" checked> Tool Result</label>
+          <label class="search-filter"><input type="checkbox" data-search-role-filter value="system" checked> System</label>
+          <label class="search-filter"><input type="checkbox" data-search-role-filter value="other" checked> Other</label>
+        </span>
         <span class="message-filter-controls" data-detail-only-control hidden>
           <button class="message-filter-controls__button" type="button" data-select-visible-messages title="Select All Messages" aria-label="Select All Messages">👀</button>
           <button class="message-filter-controls__button" type="button" data-clear-all-message-selection title="Clear Selection" aria-label="Clear Selection">×</button>
           <span class="message-filter-controls__label">Filter Messages:</span>
-          <label class="message-filter"><input type="checkbox" data-message-role-filter value="assistant" checked> Assistant</label>
-          <label class="message-filter"><input type="checkbox" data-message-role-filter value="user" checked> User</label>
-          <label class="message-filter"><input type="checkbox" data-message-role-filter value="tool" checked> Tool Result</label>
-          <label class="message-filter"><input type="checkbox" data-message-role-filter value="system" checked> System</label>
-          <label class="message-filter"><input type="checkbox" data-message-role-filter value="other" checked> Other</label>
+          <label class="message-filter"><input type="checkbox" data-message-role-filter value="assistant" checked autocomplete="off"> Assistant</label>
+          <label class="message-filter"><input type="checkbox" data-message-role-filter value="user" checked autocomplete="off"> User</label>
+          <label class="message-filter"><input type="checkbox" data-message-role-filter value="tool" checked autocomplete="off"> Tool Result</label>
+          <label class="message-filter"><input type="checkbox" data-message-role-filter value="system" checked autocomplete="off"> System</label>
+          <label class="message-filter"><input type="checkbox" data-message-role-filter value="other" checked autocomplete="off"> Other</label>
         </span>
       </span>
       <span class="toolbar__right">
@@ -2392,20 +2991,22 @@ function renderTranscriptMessage(message: TranscriptMessage, messageId: string):
   const normalizedRole = normalizeMessageRole(message.role);
   const roleLabel = labelForMessageRole(message.role);
   const avatarLabel = roleLabel.slice(0, 1).toUpperCase();
-  return `<article class="message message--${escapeHtml(normalizedRole)}" data-message data-message-role="${escapeHtml(
+  return `<article class="chat-group message message--${escapeHtml(normalizedRole)} ${escapeHtml(
     normalizedRole,
-  )}" data-message-index="${message.index}">
-    <div class="message-avatar" aria-hidden="true">${escapeHtml(avatarLabel)}</div>
-    <div class="message-body">
-      <div class="message-meta">
-        <span>${escapeHtml(roleLabel)}</span>
-        <span class="message-time">${escapeHtml(formatTimestamp(message.timestamp))}</span>
+  )}" data-message data-message-role="${escapeHtml(normalizedRole)}" data-message-index="${message.index}">
+    <div class="chat-avatar ${escapeHtml(normalizedRole)}" aria-hidden="true">${escapeHtml(avatarLabel)}</div>
+    <div class="chat-group-messages">
+      <div class="chat-bubble">
+        <div class="chat-text">${renderMessageTextHtml(message.text)}</div>
+      </div>
+      <div class="chat-group-footer">
+        <span class="chat-sender-name">${escapeHtml(roleLabel)}</span>
+        <span class="chat-group-timestamp">${escapeHtml(formatTimestamp(message.timestamp))}</span>
         <button class="message-agent-toggle" type="button" data-message-agent-toggle data-message-id="${escapeHtml(
           messageId,
         )}" data-message-index="${message.index}" aria-pressed="false" title="show agent" aria-label="show agent">👀</button>
         <button class="message-agent-toggle" type="button" data-resume-session-from-here data-message-index="${message.index}" title="Resume Session from Here" aria-label="Resume Session from Here">→</button>
       </div>
-      <p class="message-text">${escapeHtml(message.text)}</p>
     </div>
   </article>`;
 }
@@ -2700,14 +3301,22 @@ export function createSessionSearchPageHandler(
     const url = new URL(req.url ?? params.entryPath, "http://localhost");
     const pathname = url.pathname;
     if (pathname === "/plugins/session-search/api/sessions" && req.method === "GET") {
+      const selectedAgentId = resolveSelectedSearchAgentId(
+        params.api.runtime.config.current(),
+        url.searchParams.get("agent") ?? undefined,
+      );
       return writeJson(
         res,
         200,
         await loadSessionSummaryBatch({
           api: params.api,
+          agentId: selectedAgentId,
+          includedMessageRoles: parseSearchMessageRoles(url.searchParams.get("roles")),
           query: url.searchParams.get("q") ?? "",
+          searchMode: parseSearchMatchMode(url.searchParams.get("mode")),
           offset: resolveOffset(url.searchParams.get("offset")),
           limit: resolveBatchLimit(url.searchParams.get("limit")),
+          fullTextSearch: url.searchParams.get("full") !== "0",
         }),
       );
     }
@@ -2722,7 +3331,7 @@ export function createSessionSearchPageHandler(
       return writeJson(res, 200, payload);
     }
     if (pathname === "/plugins/session-search/show-session" && req.method === "POST") {
-      const data = await loadSessionSummaries(params.api);
+      const data = await loadSessionSummaries(params.api, { mode: "preview" });
       return await handleShowSessionToAgent({
         api: params.api,
         req,
@@ -2732,6 +3341,23 @@ export function createSessionSearchPageHandler(
       });
     }
     if (pathname === "/plugins/session-search" || pathname === params.entryPath) {
+      const query = url.searchParams.get("q") ?? "";
+      const limit = resolveBatchLimit(url.searchParams.get("limit"));
+      const cfg = params.api.runtime.config.current();
+      const selectedAgentId = resolveSelectedSearchAgentId(
+        cfg,
+        url.searchParams.get("agent") ?? undefined,
+      );
+      const initialBatch = await loadSessionSummaryBatch({
+        api: params.api,
+        agentId: selectedAgentId,
+        includedMessageRoles: parseSearchMessageRoles(url.searchParams.get("roles")),
+        query,
+        searchMode: parseSearchMatchMode(url.searchParams.get("mode")),
+        offset: 0,
+        limit,
+        fullTextSearch: true,
+      });
       return writeHtml(
         res,
         await renderListPage({
@@ -2740,23 +3366,26 @@ export function createSessionSearchPageHandler(
           entryPath: params.entryPath,
           storePath: "",
           showSessionActionPath: issueShowSessionActionPath(req),
-          query: url.searchParams.get("q") ?? "",
-          limit: resolveLimit(url.searchParams.get("limit")),
-          sessions: [],
+          query,
+          agentOptions: resolveSearchAgentOptions(cfg),
+          selectedAgentId,
+          limit,
+          sessions: Array.isArray(initialBatch.items)
+            ? (initialBatch.items as SessionSummary[])
+            : [],
         }),
       );
     }
     const detailPrefix = `${params.entryPath}session/`;
     if (pathname.startsWith(detailPrefix)) {
-      const data = await loadSessionSummaries(params.api);
       const key = decodeURIComponent(pathname.slice(detailPrefix.length));
-      const session = data.sessions.find((entry) => entry.key === key);
-      if (!session) {
+      const { candidates } = await resolveAllSessionSummaryCandidates({ api: params.api });
+      const candidate = candidates.find((entry) => entry.key === key);
+      if (!candidate) {
         return writeNotFound(res);
       }
-      const messages = await readTranscriptMessages(session.transcriptPath, {
-        maxMessages: MAX_DETAIL_MESSAGES,
-      });
+      const session = await summarizeSessionCandidate(candidate, { mode: "search" });
+      const messages = await readTranscriptMessages(session.transcriptPath);
       return writeHtml(
         res,
         renderDetailPage({

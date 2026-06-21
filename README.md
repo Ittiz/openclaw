@@ -4,11 +4,20 @@ Session Search is an OpenClaw Control UI plugin for finding, inspecting, injecti
 
 It is intended for OpenClaw builds that support Plugin UI Entry Points, gateway-authenticated plugin HTTP routes, session transcript access, and the `before_prompt_build` plugin hook.
 
-The current example targets OpenClaw builds containing the Plugin UI Entry Points dispatch fix from `openclaw/openclaw#80388`, verified against `4e36e35e2205382b8ee73df4ed0ef80bf53435e8`. Older compatible builds should work only when they preserve the required host APIs below.
+The current example targets OpenClaw builds containing the Plugin UI Entry Points dispatch fix from `openclaw/openclaw#80388`, verified against the 2026.6.8 PR stack used for Windows gateway testing. Older compatible builds should work only when they preserve the required host APIs below.
 
 ## Installation
 
-This repository contains only the Session Search plugin files. Install it into a compatible OpenClaw source checkout or extension workspace.
+This repository contains only the Session Search plugin files. The published example includes a built `dist/index.js` so it can be copied into a local plugin directory without an OpenClaw source tree.
+
+Example local-plugin install:
+
+```bash
+mkdir -p ~/.openclaw/workspace/local-plugins/session-search
+cp -a /path/to/session-search-plugin/. ~/.openclaw/workspace/local-plugins/session-search/
+```
+
+Then enable `session-search` from that local plugin path and restart the gateway.
 
 Example source-checkout install:
 
@@ -22,7 +31,7 @@ corepack pnpm build
 
 Then start or restart the OpenClaw gateway from that rebuilt checkout.
 
-The plugin is loaded from `extensions/session-search/index.ts` and declares its metadata in `openclaw.plugin.json`.
+Local plugin installs load `dist/index.js`. Source-checkout development can still use `index.ts` before rebuilding the package.
 
 ## Requirements
 
@@ -39,7 +48,10 @@ Older OpenClaw releases that do not include these host APIs will need the Plugin
 ## Features
 
 - Adds a `Session Search` entry to the Control UI app navigation.
+- Searches across all configured agents, with an agent filter when needed.
 - Searches indexed and discovered session transcripts from the configured session store.
+- Supports exact, all-words, and any-word search matching.
+- Filters search by user, assistant, tool, system, and other message roles.
 - Opens a session detail view with transcript metadata and message text.
 - Shows an entire source session to the active agent with `Show Session to Agent`.
 - Shows only selected messages to the active agent with `Show Selected Messages to Agent`.
@@ -84,10 +96,11 @@ These injection paths are intentionally transcript-focused:
 
 ## Compatibility
 
-Compatibility proof as of May 29, 2026:
+Compatibility proof as of June 21, 2026:
 
-- Focused Session Search tests passed after installing this plugin into the `openclaw/openclaw#80388` proof worktree at `4e36e35e2205382b8ee73df4ed0ef80bf53435e8`.
-- The host worktree build passed with the Plugin UI Entry Points dispatch fix in place.
+- The plugin loaded on the Windows gateway after copying the built local-plugin bundle into `local-plugins/session-search`.
+- `/plugins/session-search/` returned an authenticated `401`, proving the plugin route was registered.
+- The gateway log showed `session-search` in the loaded plugin set and `plugins.uiEntryPoints` succeeded.
 
 This plugin is designed as an OpenClaw workspace/bundled extension. It imports OpenClaw plugin runtime helpers and expects a compatible OpenClaw build with:
 
@@ -98,7 +111,7 @@ This plugin is designed as an OpenClaw workspace/bundled extension. It imports O
 - session store and transcript runtime APIs
 - workspace bootstrap and memory file conventions
 
-It is not currently packaged as a standalone npm plugin for older OpenClaw releases.
+It is not currently packaged as a standalone npm plugin for older OpenClaw releases. Use the built local-plugin copy or install it inside a compatible OpenClaw source checkout.
 
 ## Development
 
@@ -124,3 +137,16 @@ corepack pnpm exec oxfmt --write --threads=1 extensions/session-search
 ```
 
 The running gateway executes built files from `dist`, so source changes must be rebuilt before testing through a live gateway.
+
+Bundle for local plugin installs:
+
+```bash
+cd /path/to/openclaw
+node_modules/.bin/esbuild extensions/session-search/index.ts \
+  --bundle \
+  --platform=node \
+  --format=esm \
+  --target=node20 \
+  --outfile=extensions/session-search/dist/index.js \
+  --external:openclaw/plugin-sdk/*
+```

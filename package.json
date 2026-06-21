@@ -1,6 +1,6 @@
 {
   "name": "@openclaw/session-search",
-  "version": "2026.5.29",
+  "version": "2026.6.21",
   "private": true,
   "description": "OpenClaw session search and viewer plugin",
   "type": "module",
@@ -9,10 +9,10 @@
   },
   "openclaw": {
     "extensions": [
-      "./index.ts"
+      "./dist/index.js"
     ],
     "compat": {
-      "pluginApi": ">=2026.5.29"
+      "pluginApi": ">=2026.6.8"
     }
   }
 }
