@@ -15,7 +15,7 @@ import { applicationContext, type ApplicationContext } from "../../app/context.t
 import { hasOperatorApprovalsAccess } from "../../app/operator-access.ts";
 import { t } from "../../i18n/index.ts";
 import { resolveEmbedSandbox } from "../../lib/chat/tool-display.ts";
-import { searchForSession } from "../../lib/sessions/navigation.ts";
+import { sessionNavigationTarget } from "../../lib/sessions/route-navigation.ts";
 import { OpenClawLightDomContentsElement } from "../../lit/openclaw-element.ts";
 import { SubscriptionsController } from "../../lit/subscriptions-controller.ts";
 import { PluginUiBridgeController } from "./plugin-ui-bridge.ts";
@@ -182,8 +182,13 @@ export class PluginPage extends OpenClawLightDomContentsElement {
       sessionActions,
       allowChatNavigation: info.allowChatNavigation === true,
       navigateToChat: (targetSessionKey) => {
+        const target = sessionNavigationTarget({
+          context,
+          face: "chat",
+          sessionKey: targetSessionKey,
+        });
         context.gateway.setSessionKey(targetSessionKey);
-        context.navigate("chat", { search: searchForSession(targetSessionKey), hash: "" });
+        context.navigate("chat", { ...target.options, hash: "" });
       },
     });
   }
