@@ -176,7 +176,7 @@ export class PluginPage extends OpenClawLightDomContentsElement {
       key: this.tabKey(),
       pluginId: info.pluginId,
       client: context.gateway.snapshot.client,
-      connected: context.gateway.snapshot.connected,
+      connected: context.gateway.snapshot.phase === "connected",
       sessionKey,
       ...(typeof contextTokens === "number" && contextTokens > 0 ? { contextTokens } : {}),
       sessionActions,
