@@ -52,7 +52,7 @@ function resolveSessionActionContextTokens(
     exactRead: true,
   });
   const entry = resolveFreshestSessionEntryFromStoreKeys(target.store, target.storeKeys);
-  return buildGatewaySessionInfo({
+  const sessionContextTokens = buildGatewaySessionInfo({
     cfg,
     storePath: target.storePath,
     store: target.store,
@@ -60,6 +60,19 @@ function resolveSessionActionContextTokens(
     entry,
     agentId: target.agentId,
   }).contextTokens;
+  if (
+    typeof sessionContextTokens === "number" &&
+    Number.isFinite(sessionContextTokens) &&
+    sessionContextTokens > 0
+  ) {
+    return sessionContextTokens;
+  }
+  const defaultContextTokens = cfg.agents?.defaults?.contextTokens;
+  return typeof defaultContextTokens === "number" &&
+    Number.isFinite(defaultContextTokens) &&
+    defaultContextTokens > 0
+    ? defaultContextTokens
+    : undefined;
 }
 
 /** Ensures plugin action result extension fields stay JSON-compatible on the wire. */
