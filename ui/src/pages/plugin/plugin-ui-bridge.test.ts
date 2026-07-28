@@ -95,7 +95,6 @@ describe("PluginUiBridgeController", () => {
       pluginId: "notes",
       actionId: "save",
       sessionKey: "agent:main:active",
-      contextTokens: 64_000,
       payload: { enabled: true },
     });
     await vi.waitFor(() =>
@@ -254,7 +253,6 @@ describe("PluginUiBridgeController", () => {
         pluginId: "notes",
         actionId: "save",
         sessionKey: "agent:main:refreshed",
-        contextTokens: 128_000,
         payload: { enabled: true },
       }),
     );

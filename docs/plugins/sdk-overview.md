@@ -378,8 +378,8 @@ The frame grant accepts only `GET` and `HEAD` and always carries
 `operator.read`; `requiredScopes` controls tab visibility but never widens the
 cookie grant. An external tab that needs a mutation can declare an explicit
 `sessionActions` allowlist. The parent invokes only those plugin-owned actions
-through `plugins.sessionAction`, supplies the active Control UI session key and
-known context-window size,
+through `plugins.sessionAction` and supplies the active Control UI session key.
+The Gateway derives the action's context-window size from trusted session/model state
 and leaves the action's registered operator-scope and payload-schema checks in
 force. `allowChatNavigation: true` separately allows the tab to return the
 parent to a chat session. There is no generic parent fetch proxy and the frame

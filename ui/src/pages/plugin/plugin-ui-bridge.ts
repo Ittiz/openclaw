@@ -197,7 +197,6 @@ export class PluginUiBridgeController {
         pluginId: target.pluginId,
         actionId,
         sessionKey: target.sessionKey,
-        ...(target.contextTokens !== undefined ? { contextTokens: target.contextTokens } : {}),
         ...(message.payload !== undefined ? { payload: message.payload } : {}),
       });
       this.reply(target, port, id, { ok: true, result });

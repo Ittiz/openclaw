@@ -57,7 +57,9 @@ async function callPluginSessionActionForTest(params: {
     } as GatewayClient,
     isWebchatConnect: () => false,
     respond,
-    context: { getRuntimeConfig: () => ({}) } as never,
+    context: {
+      getRuntimeConfig: () => ({ agents: { defaults: { contextTokens: 64_000 } } }),
+    } as never,
   });
   return response ?? { ok: false, error: new Error("handler did not respond") };
 }
@@ -323,7 +325,6 @@ describe("plugin session actions", () => {
     await expect(
       callSchemaAction("approve", {
         sessionKey: MAIN_SESSION_KEY,
-        contextTokens: 64_000,
         payload: { version: "2026.05.01" },
       }),
     ).resolves.toEqual({
@@ -344,6 +345,14 @@ describe("plugin session actions", () => {
         scopes: [WRITE_SCOPE],
       },
     ]);
+
+    const callerSelectedLimit = await callSchemaAction("approve", {
+      sessionKey: MAIN_SESSION_KEY,
+      contextTokens: 1,
+      payload: { version: "2026.05.01" },
+    });
+    expect(requireHookError(callerSelectedLimit).code).toBe("INVALID_REQUEST");
+    expect(handlerCalls).toHaveLength(1);
 
     await expect(callSchemaAction("typed-error")).resolves.toEqual({
       ok: true,
