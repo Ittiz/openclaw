@@ -1,21 +1,30 @@
 import { buildSandboxHostPath } from "../agents/sandbox-host.js";
-import type { BoardWidgetDocument } from "../boards/board-store.js";
+import type { BoardWidgetHtmlViewMetadata } from "../boards/board-store.js";
 
-function grantedConnectOrigins(document: BoardWidgetDocument): string[] | undefined {
-  if (!("html" in document) || document.grantState !== "granted") {
+type BoardWidgetSandboxMetadata = Pick<BoardWidgetHtmlViewMetadata, "declared" | "grantState">;
+
+function grantedConnectOrigins(document: BoardWidgetSandboxMetadata): string[] | undefined {
+  if (document.grantState !== "granted") {
     return undefined;
   }
   const origins = document.declared?.netOrigins;
   return origins?.length ? origins : undefined;
 }
 
-export function buildBoardWidgetSandboxPath(document: BoardWidgetDocument): string {
+export function buildBoardWidgetSandboxPath(document: BoardWidgetSandboxMetadata): string {
   const connectDomains = grantedConnectOrigins(document);
-  return buildSandboxHostPath(connectDomains ? { connectDomains } : undefined);
+  return buildSandboxHostPath({
+    // Best-effort hardening for the documented WebRTC residual; the DOM guard
+    // reduces fresh descendant realms but is not an authorization boundary.
+    blockDescendantFrames: true,
+    ...(connectDomains ? { connectDomains } : {}),
+  });
 }
 
 /** Defense in depth for direct/legacy widget document loads outside the proxy host. */
-export function buildBoardWidgetContentSecurityPolicy(document: BoardWidgetDocument): string {
+export function buildBoardWidgetContentSecurityPolicy(
+  document: BoardWidgetSandboxMetadata,
+): string {
   const connectSources = grantedConnectOrigins(document)?.join(" ") ?? "'none'";
   return [
     "default-src 'none'",

@@ -39,8 +39,9 @@ function gatewayWithClient(
 ): ApplicationContext["gateway"] {
   const snapshot: ApplicationGatewaySnapshot = {
     client,
-    connected,
-    reconnecting: false,
+    phase: connected ? "connected" : "stopped",
+    offlineStable: false,
+    canvasPluginSurfaceUrl: null,
     hello: null,
     assistantAgentId: null,
     sessionKey: "main",
@@ -112,7 +113,7 @@ function contextWithMutableGateway(client: GatewayBrowserClient) {
   return {
     context,
     emitConnected(connected: boolean) {
-      currentSnapshot = { ...currentSnapshot, connected };
+      currentSnapshot = { ...currentSnapshot, phase: connected ? "connected" : "stopped" };
       for (const listener of listeners) {
         listener(currentSnapshot);
       }
@@ -153,7 +154,7 @@ describe("gateway source replacement across reconnect with a reused client", () 
       result: { count: 1, sessions: [{ key: "old" }] },
       error: null,
       expandedSessionKey: null,
-      showArchived: false,
+      statusFilter: "active",
     } as unknown as SessionsRouteData;
     const page = createPage("openclaw-sessions-page", context) as TestPage & {
       routeData: SessionsRouteData;
@@ -236,6 +237,9 @@ describe("gateway source replacement across reconnect with a reused client", () 
 
     document.body.append(page);
     await page.updateComplete;
+    await waitForFast(() =>
+      expect(request).toHaveBeenCalledWith("sessions.usage", expect.any(Object)),
+    );
     await waitForFast(() => expect(page.usageResult).toBe(freshResult));
 
     expect(request).toHaveBeenCalledWith("sessions.usage", expect.any(Object));
@@ -276,7 +280,7 @@ describe("gateway source replacement across reconnect with a reused client", () 
     await page.updateComplete;
     page.refreshRuntime.applyGatewaySnapshot({
       ...context.gateway.snapshot,
-      connected: false,
+      phase: "stopped",
     });
     page.refreshRuntime.applyGatewaySnapshot(context.gateway.snapshot);
     await Promise.resolve();
@@ -287,15 +291,23 @@ describe("gateway source replacement across reconnect with a reused client", () 
   it("retries a usage load interrupted by a same-client disconnect", async () => {
     vi.spyOn(document, "hasFocus").mockReturnValue(true);
     vi.spyOn(document, "visibilityState", "get").mockReturnValue("visible");
-    const request = vi.fn(async (method: string) =>
-      method === "sessions.usage" ? { sessions: [] } : {},
-    );
+    const interrupted = deferred<UsageRouteData["result"]>();
+    const freshResult = { sessions: [{ key: "fresh" }] } as unknown as UsageRouteData["result"];
+    let usageRequestCount = 0;
+    const request = vi.fn(async (method: string) => {
+      if (method !== "sessions.usage") {
+        return {};
+      }
+      usageRequestCount += 1;
+      return usageRequestCount === 1 ? interrupted.promise : freshResult;
+    });
     const client = { request } as unknown as GatewayBrowserClient;
     const context = contextWithClient(client, { connected: true });
     const page = createPage("openclaw-usage-page", context) as TestPage & {
       routeData: UsageRouteData;
-      usageLoading: boolean;
+      usageResult: UsageRouteData["result"];
       refreshRuntime: {
+        request: (reason: UsageRefreshReason) => void;
         applyGatewaySnapshot: (snapshot: ApplicationGatewaySnapshot) => void;
       };
     };
@@ -318,16 +330,22 @@ describe("gateway source replacement across reconnect with a reused client", () 
 
     document.body.append(page);
     await page.updateComplete;
-    page.usageLoading = true;
+    page.refreshRuntime.request("manual");
+    await waitForFast(() => expect(usageRequestCount).toBe(1));
     page.refreshRuntime.applyGatewaySnapshot({
       ...context.gateway.snapshot,
-      connected: false,
+      phase: "stopped",
     });
     page.refreshRuntime.applyGatewaySnapshot(context.gateway.snapshot);
 
     await waitForFast(() =>
-      expect(request).toHaveBeenCalledWith("sessions.usage", expect.any(Object)),
+      expect(request.mock.calls.filter(([method]) => method === "sessions.usage")).toHaveLength(2),
     );
+    await waitForFast(() => expect(page.usageResult).toBe(freshResult));
+    interrupted.resolve({ sessions: [{ key: "stale" }] } as unknown as UsageRouteData["result"]);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(page.usageResult).toBe(freshResult);
   });
 
   it("gates same-client usage reconnects by payload age and page visibility", async () => {
@@ -347,7 +365,7 @@ describe("gateway source replacement across reconnect with a reused client", () 
     const result = { sessions: [] } as unknown as UsageRouteData["result"];
     const page = createPage("openclaw-usage-page", harness.context) as TestPage & {
       routeData: UsageRouteData;
-      usageLoading: boolean;
+      readonly usageLoading: boolean;
       refreshRuntime: {
         request: (reason: UsageRefreshReason) => void;
         setLastLoadedAtMs: (value: number | null) => void;
@@ -393,7 +411,6 @@ describe("gateway source replacement across reconnect with a reused client", () 
       "usage.status",
     ]);
 
-    page.usageLoading = true;
     page.refreshRuntime.request("manual");
     await waitForFast(() => expect(page.usageLoading).toBe(false));
     expect(request).toHaveBeenCalledTimes(6);
@@ -539,7 +556,7 @@ describe("gateway source replacement across reconnect with a reused client", () 
     };
     document.body.append(page);
     await page.updateComplete;
-    (context.gateway.snapshot as ApplicationGatewaySnapshot).connected = true;
+    (context.gateway.snapshot as ApplicationGatewaySnapshot).phase = "connected";
     page.connected = true;
 
     const load = page.loadAgents();
@@ -619,7 +636,7 @@ describe("gateway source replacement across reconnect with a reused client", () 
     };
     document.body.append(page);
     await page.updateComplete;
-    (context.gateway.snapshot as ApplicationGatewaySnapshot).connected = true;
+    (context.gateway.snapshot as ApplicationGatewaySnapshot).phase = "connected";
     page.connected = true;
 
     const load = page.loadDiagnostics();

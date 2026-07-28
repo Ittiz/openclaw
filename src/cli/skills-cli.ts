@@ -16,6 +16,8 @@ import {
 import { getRuntimeConfig } from "../config/config.js";
 import { CLAWHUB_TRUST_ERROR_CODE } from "../infra/clawhub-install-trust.js";
 import {
+  CLAWHUB_SKILLS_SH_TRUST_LABEL,
+  CLAWHUB_SKILLS_SH_TRUST_STATE,
   fetchClawHubSkillCard,
   fetchClawHubSkillVerification,
   type ClawHubSkillVerificationResponse,
@@ -53,6 +55,7 @@ import {
   reviseSkillProposal,
 } from "../skills/workshop/service.js";
 import type {
+  SkillProposalApplyResult,
   SkillProposalManifest,
   SkillProposalReadResult,
   SkillProposalSupportFileInput,
@@ -61,7 +64,9 @@ import { CONFIG_DIR } from "../utils.js";
 import { resolveClawHubRiskAcknowledgementCliOptions } from "./clawhub-risk-acknowledgement.js";
 import { resolveOptionFromCommand } from "./cli-utils.js";
 import { parseStrictPositiveIntOption } from "./program/helpers.js";
+import { setCommandJsonMode } from "./program/json-mode.js";
 import { formatSkillInfo, formatSkillsCheck, formatSkillsList } from "./skills-cli.format.js";
+import { isSkillsMachineOutput } from "./skills-output-mode.js";
 
 export type {
   SkillInfoOptions,
@@ -116,6 +121,7 @@ type ResolveSkillsWorkspaceOptions = {
 type ResolvedSkillsWorkspace = ReturnType<typeof resolveSkillsWorkspace>;
 
 const GATEWAY_SKILLS_STATUS_TIMEOUT_MS = 1_500;
+const GATEWAY_SKILLS_MUTATION_TIMEOUT_MS = 10_000;
 
 function resolveSkillsWorkspace(options?: ResolveSkillsWorkspaceOptions): {
   config: ReturnType<typeof getRuntimeConfig>;
@@ -237,7 +243,16 @@ function buildSkillVerificationOutput(
         selector: target.resolution.selector,
         registry: target.resolution.registry,
         installedVersion: target.resolution.installedVersion,
+        ...(target.requestedReference ? { reference: target.requestedReference } : {}),
       },
+      ...(target.trustState
+        ? {
+            trust: {
+              state: target.trustState,
+              label: CLAWHUB_SKILLS_SH_TRUST_LABEL,
+            },
+          }
+        : {}),
       ...(verifiedSourceUrl ? { verifiedSourceUrl } : {}),
     },
   };
@@ -382,6 +397,49 @@ async function runSkillCuratorMutation(method: "pin" | "restore" | "unpin", skil
   return restoreCuratedSkill(skill);
 }
 
+async function runSkillProposalApply(
+  resolved: ResolvedSkillsWorkspace,
+  proposalId: string,
+): Promise<SkillProposalApplyResult> {
+  const { callGateway, isGatewayTransportError } = await import("../gateway/call.js");
+  try {
+    // Decide offline fallback before dispatching the non-idempotent mutation.
+    // Once a Gateway answers, apply failures must never be replayed locally.
+    await callGateway({
+      config: resolved.config,
+      method: "health",
+      params: {},
+      timeoutMs: GATEWAY_SKILLS_STATUS_TIMEOUT_MS,
+      clientName: GATEWAY_CLIENT_NAMES.CLI,
+      mode: GATEWAY_CLIENT_MODES.CLI,
+      requiredMethods: ["skills.proposals.apply"],
+    });
+  } catch (err) {
+    if (
+      resolved.config.gateway?.mode === "remote" ||
+      !isGatewayTransportError(err) ||
+      err.kind !== "closed" ||
+      err.code !== 1006
+    ) {
+      throw err;
+    }
+    return await applySkillProposal({
+      workspaceDir: resolved.workspaceDir,
+      config: resolved.config,
+      proposalId,
+    });
+  }
+
+  return await callGateway<SkillProposalApplyResult>({
+    config: resolved.config,
+    method: "skills.proposals.apply",
+    params: { agentId: resolved.agentId, proposalId },
+    timeoutMs: GATEWAY_SKILLS_MUTATION_TIMEOUT_MS,
+    clientName: GATEWAY_CLIENT_NAMES.CLI,
+    mode: GATEWAY_CLIENT_MODES.CLI,
+  });
+}
+
 async function readSkillProposalInput(options: {
   proposal?: string;
   proposalDir?: string;
@@ -413,6 +471,7 @@ export function registerSkillsCli(program: Command) {
       () =>
         `\n${theme.muted("Docs:")} ${formatDocsLink("/cli/skills", "docs.openclaw.ai/cli/skills")}\n`,
     );
+  setCommandJsonMode(skills, "output", ({ argv }) => isSkillsMachineOutput(argv));
 
   skills
     .command("search")
@@ -435,13 +494,24 @@ export function registerSkillsCli(program: Command) {
           return;
         }
         for (const entry of results) {
+          const installRef = normalizeOptionalString(entry.installRef);
           const ownerHandle = normalizeOptionalString(entry.ownerHandle);
           const slug = formatClawHubSearchText(entry.slug);
-          const skillRef = ownerHandle ? `@${formatClawHubSearchText(ownerHandle)}/${slug}` : slug;
+          const skillsShInstallRef =
+            installRef?.startsWith("skills-sh:") &&
+            entry.trustState === CLAWHUB_SKILLS_SH_TRUST_STATE
+              ? installRef
+              : undefined;
+          const skillRef = skillsShInstallRef
+            ? formatClawHubSearchText(skillsShInstallRef)
+            : ownerHandle
+              ? `@${formatClawHubSearchText(ownerHandle)}/${slug}`
+              : slug;
           const version = entry.version ? ` v${formatClawHubSearchText(entry.version)}` : "";
           const summary = entry.summary ? `  ${formatClawHubSearchText(entry.summary)}` : "";
           const displayName = formatClawHubSearchText(entry.displayName);
-          defaultRuntime.log(`${skillRef}${version}  ${displayName}${summary}`);
+          const trust = skillsShInstallRef ? `  ${CLAWHUB_SKILLS_SH_TRUST_LABEL}` : "";
+          defaultRuntime.log(`${skillRef}${version}  ${displayName}${summary}${trust}`);
         }
       } catch (err) {
         defaultRuntime.error(String(err));
@@ -454,7 +524,7 @@ export function registerSkillsCli(program: Command) {
     .description("Install a skill from ClawHub, git, or a local directory")
     .argument(
       "<skill-ref>",
-      "ClawHub skill ref (@owner/slug), git:<repo>, or local skill directory",
+      "ClawHub skill ref (@owner/slug or skills-sh:owner/repo/slug), git:<repo>, or local skill directory",
     )
     .option("--version <version>", "Install a specific version")
     .option("--force", "Overwrite an existing workspace skill", false)
@@ -471,7 +541,10 @@ export function registerSkillsCli(program: Command) {
     .option("--global", "Install into the shared managed skills directory", false)
     .option("--agent <id>", "Target agent workspace (defaults to cwd-inferred, then default agent)")
     .option("--as <slug>", "Install a git/local skill under this slug")
-    .addHelpText("after", "\nExamples:\n  openclaw skills install @owner/weather\n")
+    .addHelpText(
+      "after",
+      "\nExamples:\n  openclaw skills install @owner/weather\n  openclaw skills install skills-sh:owner/repo/weather\n",
+    )
     .action(
       async (
         slug: string,
@@ -490,6 +563,11 @@ export function registerSkillsCli(program: Command) {
         try {
           const workspaceDir = resolveClawHubTargetWorkspaceDir(command, opts);
           if (!workspaceDir) {
+            return;
+          }
+          if (slug.trim().startsWith("skills-sh/")) {
+            defaultRuntime.error(`Invalid skills.sh skill reference: ${slug}`);
+            defaultRuntime.exit(1);
             return;
           }
           if (isSkillSourceInstallSpec(slug)) {
@@ -522,6 +600,11 @@ export function registerSkillsCli(program: Command) {
             defaultRuntime.error(
               "--as is only supported for git and local directory skill installs.",
             );
+            defaultRuntime.exit(1);
+            return;
+          }
+          if (slug.trim().startsWith("skills-sh:") && opts.version) {
+            defaultRuntime.error("--version is not supported for skills-sh references.");
             defaultRuntime.exit(1);
             return;
           }
@@ -685,6 +768,9 @@ export function registerSkillsCli(program: Command) {
             const verification = await fetchClawHubSkillVerification({
               slug: target.slug,
               ...(target.ownerHandle ? { ownerHandle: target.ownerHandle } : {}),
+              ...(target.requestedReference
+                ? { requestedReference: target.requestedReference }
+                : {}),
               version: target.version,
               tag: target.tag,
               baseUrl: target.baseUrl,
@@ -990,8 +1076,8 @@ export function registerSkillsCli(program: Command) {
     .action(
       async (proposalId: string, opts: { json?: boolean; agent?: string }, command: Command) => {
         try {
-          const { config, workspaceDir } = resolveSkillsWorkspaceForCommand(command.parent, opts);
-          const applied = await applySkillProposal({ workspaceDir, config, proposalId });
+          const resolved = resolveSkillsWorkspaceForCommand(command.parent, opts);
+          const applied = await runSkillProposalApply(resolved, proposalId);
           if (opts.json) {
             defaultRuntime.writeJson(applied);
             return;

@@ -76,6 +76,34 @@ describe("plugin registry Control UI descriptors", () => {
     ]);
   });
 
+  it("accepts trusted dashboard widget descriptors", () => {
+    const { config, registry } = createPluginRegistryFixture();
+    registerTestPlugin({
+      registry,
+      config,
+      record: createPluginRecord({ id: "workboard", name: "Workboard" }),
+      register(api) {
+        api.session.controls.registerControlUiDescriptor({
+          surface: "widget",
+          id: "card",
+          label: "Workboard card",
+          requiredScopes: ["operator.read"],
+        });
+      },
+    });
+
+    expect(registry.registry.controlUiDescriptors).toEqual([
+      expect.objectContaining({
+        pluginId: "workboard",
+        descriptor: expect.objectContaining({
+          id: "card",
+          surface: "widget",
+          label: "Workboard card",
+        }),
+      }),
+    ]);
+  });
+
   it("rejects tab bridge capabilities on non-tab descriptors", () => {
     const { config, registry } = createPluginRegistryFixture();
     registerTestPlugin({

@@ -1,10 +1,10 @@
 import { vi } from "vitest";
-import type { GatewaySessionRow } from "../../api/types.ts";
 import type { RouteId } from "../../app-route-paths.ts";
 import type { ApplicationContext } from "../../app/context.ts";
 import type { BoardWidget } from "../../lib/board/types.ts";
 import type { BoardViewCallbacks, BoardViewSnapshot } from "../../lib/board/view-types.ts";
 import { createApplicationContextProvider } from "../../test-helpers/application-context.ts";
+import { settleLitElement, settleLitElements } from "../../test-helpers/lit-settle.ts";
 
 type OpenClawBoardView = HTMLElementTagNameMap["openclaw-board-view"];
 type OpenClawBoardWidgetCell = HTMLElementTagNameMap["openclaw-board-widget-cell"];
@@ -96,9 +96,13 @@ export function deferredValue<T>(): {
 }
 
 export async function settleCells(view: OpenClawBoardView): Promise<OpenClawBoardWidgetCell[]> {
-  await view.updateComplete;
+  // Cells appear during the view's own update, and a cell can schedule a further update
+  // while completing, so both levels drain to Lit's settled state. Anything less lets a
+  // frame's ticket-refresh timer be armed after the test has moved the clock on.
+  await settleLitElement(view);
   const cells = [...view.querySelectorAll("openclaw-board-widget-cell")];
-  await Promise.all(cells.map((cell) => cell.updateComplete));
+  await settleLitElements(cells);
+  await settleLitElement(view);
   return cells;
 }
 
@@ -108,8 +112,9 @@ export async function mount(
     activeTabId?: string;
     callbacks?: BoardViewCallbacks;
     widgetFrameUrl?: (name: string, revision: number) => string;
-    sessions?: readonly GatewaySessionRow[];
     context?: ApplicationContext<RouteId>;
+    canMutate?: boolean;
+    canGrant?: boolean;
   } = {},
 ): Promise<OpenClawBoardView> {
   const view = document.createElement("openclaw-board-view");
@@ -117,7 +122,8 @@ export async function mount(
   view.activeTabId = options.activeTabId ?? "main";
   view.widgetFrameUrl = options.widgetFrameUrl ?? (() => "about:blank");
   view.callbacks = options.callbacks ?? callbacks();
-  view.sessions = options.sessions ?? [];
+  view.canMutate = options.canMutate ?? true;
+  view.canGrant = options.canGrant ?? true;
   if (options.context) {
     const provider = createApplicationContextProvider(options.context);
     provider.append(view);

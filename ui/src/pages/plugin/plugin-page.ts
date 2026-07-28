@@ -311,7 +311,7 @@ export class PluginPage extends OpenClawLightDomContentsElement {
     const context = this.context;
     if (
       !context ||
-      !context.gateway.snapshot.connected ||
+      context.gateway.snapshot.phase !== "connected" ||
       this.externalAuthTargetKey !== targetKey ||
       this.externalAuthRefreshMarker ||
       this.externalAuthProbeMarker
@@ -550,7 +550,8 @@ export class PluginPage extends OpenClawLightDomContentsElement {
   }
 
   private updateGatewaySource(gateway: ApplicationContext<RouteId>["gateway"]) {
-    const { client, connected } = gateway.snapshot;
+    const { client } = gateway.snapshot;
+    const connected = gateway.snapshot.phase === "connected";
     if (
       this.gatewaySource === gateway &&
       this.gatewayClient === client &&
@@ -590,7 +591,7 @@ export class PluginPage extends OpenClawLightDomContentsElement {
       return this.bundledView.render({
         host: this.bundledViewHost,
         client: snapshot.client,
-        connected: snapshot.connected,
+        connected: snapshot.phase === "connected",
         embed: config
           ? {
               embedSandboxMode: config.embedSandboxMode,

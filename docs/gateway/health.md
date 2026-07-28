@@ -18,7 +18,7 @@ Short guide to verify channel connectivity without guessing.
 - `openclaw health --verbose` (alias `--debug`) - forces a live health probe and prints gateway connection details.
 - `openclaw health --json` - machine-readable health snapshot output.
 - Send `/status` as a standalone chat command in any channel to get a status reply without invoking the agent.
-- Logs: tail `/tmp/openclaw/openclaw-*.log` and filter for `web-heartbeat`, `web-reconnect`, `web-auto-reply`, `web-inbound`.
+- Logs: run `openclaw logs --follow` (or `openclaw --profile <profile> logs --follow`) and filter for `web-heartbeat`, `web-reconnect`, `web-auto-reply`, `web-inbound`.
 
 For Discord and other chat providers, session rows are not socket liveness.
 `openclaw sessions`, Gateway `sessions.list`, and the agent `sessions_list` tool
@@ -40,6 +40,7 @@ health commands above for live connectivity checks.
 - `channels.<provider>.healthMonitor.enabled`: disable health-monitor restarts for a specific channel while leaving global monitoring enabled.
 - `channels.<provider>.accounts.<accountId>.healthMonitor.enabled`: multi-account override that wins over the channel-level setting.
 - These per-channel overrides apply to the built-in channels that expose them today: Discord, Google Chat, iMessage, IRC, Microsoft Teams, Signal, Slack, Telegram, and WhatsApp.
+- A crashing channel is recovered by its own auto-restart backoff first (`auto-restart attempt N/10` in the logs). The health monitor stays out of the way until that ladder ends with `giving up after 10 restart attempts`, then takes over as the last restart owner.
 
 ## Uptime monitoring
 
@@ -60,7 +61,7 @@ When no `x-openclaw-session-key` header or `user` field is provided, `/v1/chat/c
 
 - `logged out` or status 409-515 -> relink with `openclaw channels logout` then `openclaw channels login`.
 - Gateway unreachable -> start it: `openclaw gateway --port 18789` (use `--force` if the port is busy).
-- No inbound messages -> confirm linked phone is online and the sender is allowed (`channels.whatsapp.allowFrom`); for group chats, ensure allowlist + mention rules match (`channels.whatsapp.groups`, `agents.list[].groupChat.mentionPatterns`).
+- No inbound messages -> confirm linked phone is online and the sender is allowed (`channels.whatsapp.allowFrom`); for group chats, ensure allowlist + mention rules match (`channels.whatsapp.groups`, `agents.entries.*.groupChat.mentionPatterns`).
 
 ## Dedicated "health" command
 
