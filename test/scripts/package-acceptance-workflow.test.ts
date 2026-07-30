@@ -2587,6 +2587,7 @@ describe("package artifact reuse", () => {
     expect(releaseJob.if).toContain('contains(fromJSON(\'["all","qa","qa-live"]\')');
     expect(releaseJob.with).toMatchObject({
       expected_sha: "${{ needs.resolve_target.outputs.revision }}",
+      fail_fast: "${{ fromJSON(needs.resolve_target.outputs.fail_fast) }}",
       run_matrix: true,
     });
     for (const lane of ["mock_parity", "telegram", "discord", "whatsapp", "slack"]) {
@@ -2607,6 +2608,7 @@ describe("package artifact reuse", () => {
     expect(releaseWorkflow).not.toContain("Run QA Lab live Matrix lane");
     expect(releaseWorkflow).not.toContain("pnpm openclaw qa matrix");
     expect(qaWorkflow).toContain("pnpm openclaw qa matrix");
+    expect(qaWorkflow).toContain('if [[ "$FAIL_FAST" == "true" ]]');
     expect(qaWorkflow).toContain('trusted_reason="repository-branch"');
     expect(qaWorkflow).toContain('"${selected_revision}" != "${EXPECTED_SHA}"');
     expect(qaWorkflow).toContain("EXPECTED_SHA: ${{ inputs.expected_sha }}");
@@ -2628,25 +2630,17 @@ describe("package artifact reuse", () => {
     ).filter((input) => input.startsWith("matrix_"));
     expect(matrixSpecificInputs).toEqual([]);
     expect(workflowStep(matrixJob, "Upload Matrix QA artifacts").with?.name).toBe(
-      "${{ inputs.expected_sha != '' && format('release-qa-live-matrix-{0}-shard-{1}-of-5', inputs.expected_sha, matrix.shard) || format('qa-live-matrix-{0}-{1}-shard-{2}-of-5', github.run_id, github.run_attempt, matrix.shard) }}",
+      "${{ inputs.expected_sha != '' && format('release-qa-live-matrix-{0}', inputs.expected_sha) || format('qa-live-matrix-{0}-{1}', github.run_id, github.run_attempt) }}",
     );
     expect(matrixJob["continue-on-error"]).toBeUndefined();
-    expect(matrixJob.strategy?.matrix?.shard).toEqual([1, 2, 3, 4, 5]);
-    expect(workflowStep(matrixJob, "Run Matrix live lane").run).toContain(
-      '--shard "${{ matrix.shard }}/5"',
-    );
-    expect(workflowStep(matrixJob, "Run Matrix live lane").run).toContain(
-      "Selected target predates profile-free Matrix catalog sharding",
-    );
-    expect(readWorkflow(QA_LIVE_TRANSPORTS_WORKFLOW).jobs?.run_live_matrix_sharded).toBeUndefined();
+    expect(matrixJob.strategy).toBeUndefined();
+    expect(workflowStep(matrixJob, "Run Matrix live lane").env).toEqual({
+      FAIL_FAST: "${{ inputs.fail_fast }}",
+      OPENCLAW_QA_REDACT_PUBLIC_METADATA: "1",
+    });
     expect(releaseTelegramWorkflow).toContain(
       'echo "Telegram live lane failed on attempt ${attempt}; retrying once..." >&2',
     );
-    expect(workflowStep(matrixJob, "Run Matrix live lane").run).not.toContain("for attempt in");
-    expect(qaWorkflow).not.toContain("Matrix live lane failed on attempt");
-    expect(qaWorkflow).not.toContain("OPENCLAW_QA_MATRIX_CANARY_TIMEOUT_MS");
-    expect(qaWorkflow).not.toContain("--profile");
-    expect(qaWorkflow).not.toContain("--fail-fast");
   });
 
   it("runs live transport lanes nightly while release checks stay gated", () => {
@@ -2754,7 +2748,7 @@ describe("package artifact reuse", () => {
     expect(laneJob.strategy?.matrix?.lane).toContain('["core"]');
     const runtimePairRun = workflowStep(laneJob, "Run runtime-pair lane").run;
     expect(runtimePairRun).toContain('--runtime-pair-lane "$RUNTIME_PAIR_LANE"');
-    expect(runtimePairRun).toContain("--runtime-parity-tier standard,live-only");
+    expect(runtimePairRun).toContain("--runtime-parity-tier standard");
     expect(runtimePairRun).toContain("--runtime-parity-tier soak");
     expect(runtimePairRun).toContain("Frozen candidate cannot select runtime-pair lane");
     expect(workflowStep(laneJob, "Run runtime-pair lane")["continue-on-error"]).toBe(true);
@@ -3067,6 +3061,7 @@ describe("package artifact reuse", () => {
     expect(npmTelegramJob.if).not.toContain("inputs.rerun_group == 'all'");
     expect(dispatchStep.env).toEqual({
       CHILD_WORKFLOW_REF: "${{ github.ref_name }}",
+      FAIL_FAST: "${{ inputs.fail_fast }}",
       GH_TOKEN: "${{ github.token }}",
       PACKAGE_SPEC: "${{ inputs.npm_telegram_package_spec || inputs.release_package_spec }}",
       PARENT_WORKFLOW_SHA: "${{ github.sha }}",
@@ -3401,17 +3396,9 @@ describe("package artifact reuse", () => {
     const telegramStatus = workflowJob(RELEASE_TELEGRAM_QA_WORKFLOW, "advisory_status");
     expect(telegramStatus["continue-on-error"]).toBeUndefined();
     const telegramRecord = workflowStep(telegramStatus, "Record advisory status");
-    expectTextToIncludeAll(telegramRecord.run, [
-      "run_id=",
-      "run_attempt=",
-      "target_sha=",
-      "workflow_sha=",
-      "job=",
-      "variant=",
-      "status=",
-      "job_status=",
-      "step_outcomes=",
-    ]);
+    expect(telegramRecord.run?.trim()).toBe(
+      "set -euo pipefail\nnode scripts/release-telegram-qa.mjs advisory-status",
+    );
     const telegramStatusUpload = workflowStep(telegramStatus, "Upload advisory status");
     expect(telegramStatusUpload.if).toBe("always()");
     expect(telegramStatusUpload.uses).toBe(UPLOAD_ARTIFACT_V7);
@@ -4448,9 +4435,17 @@ wait_for_run plugin-clawhub-new.yml 123 "${expectedSha}" || status=$?
       "validate_macos_release_request",
     );
     const stepNames = validateJob.steps?.map((step) => step.name) ?? [];
+    const buildControlUi = validateJob.steps?.find((step) => step.name === "Build Control UI");
 
     expect(stepNames).not.toContain("Ensure matching GitHub release exists");
     expect(macosRelease.jobs?.validate_macos_release_request).toBeDefined();
+    expect(buildControlUi?.env?.OPENCLAW_CONTROL_UI_RELEASE_BUILD).toBe("1");
+  });
+
+  it("classifies fast pretag Control UI output as a release artifact", () => {
+    const script = readFileSync("scripts/release-fast-pretag-check.sh", "utf8");
+
+    expect(script).toContain("OPENCLAW_CONTROL_UI_RELEASE_BUILD=1 pnpm ui:build");
   });
 
   it("keeps every tracked repository skill visible to Git-aware syncs", () => {
@@ -4473,6 +4468,14 @@ wait_for_run plugin-clawhub-new.yml 123 "${expectedSha}" || status=$?
     expect(ignored.status).toBe(1);
     expect(ignored.stdout).toBe("");
     expect(ignored.stderr).toBe("");
+  });
+
+  it("does not track generated node_modules entries", () => {
+    const tracked = execFileSync("git", ["ls-files", "-z", "--", ":(glob)**/node_modules/**"], {
+      encoding: "utf8",
+    });
+
+    expect(tracked).toBe("");
   });
 
   it("keeps tracked sync metadata and QA Mantis sources visible to remote full syncs", () => {

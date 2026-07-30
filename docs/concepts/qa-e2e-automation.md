@@ -71,6 +71,12 @@ ownership. An explicit profile coverage ID selects every eligible primary owner
 for that ID, deduplicated by scenario. Scenario file and taxonomy order do not
 affect membership or execution order.
 
+`scenario.execution.channels` is an OR eligibility list: a channel-specific
+runner may execute the scenario on any one listed channel. Profile-backed
+execution expands that same list across every channel supported by the selected
+driver, and the profile run passes only when every expanded channel execution
+passes. This applies uniformly to every taxonomy profile.
+
 Slim evidence omits per-entry `execution` and sets `evidenceMode: "slim"`;
 `smoke-ci` defaults to slim, and `--evidence-mode full` restores full entries:
 
@@ -204,12 +210,7 @@ declares Matrix eligibility through `execution.channel` or
 `--fail-fast` for a shorter feedback loop or repeat `--scenario <id>` for an
 explicit subset, including portable scenarios with no channel restriction.
 
-Declarative scenario metadata is the only default-membership source. The
-Matrix runner has no named profiles or scenario-id allowlists. The run chooses
-the channel driver; deterministic `--shard <index>/<total>` partitioning only
-distributes the selected catalog and does not define semantic membership or
-execution priority.
-Their live implementations live under
+Matrix live implementations live under
 `extensions/qa-lab/src/live-transports/matrix/scenarios/`.
 
 The adapter provisions a disposable Tuwunel homeserver in Docker (default
@@ -224,7 +225,6 @@ Common options:
 | Flag                     | Default           | Purpose                                                                              |
 | ------------------------ | ----------------- | ------------------------------------------------------------------------------------ |
 | `--scenario <id>`        | -                 | Select one scenario; repeatable.                                                     |
-| `--shard <index/total>`  | -                 | Run one deterministic, balanced partition of the selected Matrix catalog.            |
 | `--fail-fast`            | off               | Stop after the first failed check or scenario.                                       |
 | `--allow-failures`       | off               | Write artifacts without returning a failing exit code for scenario failures.         |
 | `--provider-mode <mode>` | `live-frontier`   | Use `mock-openai` for deterministic dispatch or `live-frontier` for a live provider. |
@@ -405,7 +405,8 @@ when the maintainer secret is present.
 
 The root `taxonomy.yaml` defines semantic coverage IDs. Scenario YAML files
 under `qa/scenarios/` map each scenario to those IDs and own execution
-metadata; `channel` is the only channel requirement. Taxonomy profiles select
+metadata; `execution.channel` or `execution.channels` declares channel
+requirements. Taxonomy profiles select
 coverage IDs or whole categories, and the catalog resolves their primary
 scenario owners. Transport runners apply channel and provider eligibility to
 that result instead of keeping scenario-ID allowlists. The channel driver is
@@ -492,37 +493,17 @@ Required env when `--credential-source env`:
 - `OPENCLAW_QA_TELEGRAM_DRIVER_BOT_TOKEN`
 - `OPENCLAW_QA_TELEGRAM_SUT_BOT_TOKEN`
 
-The `release` profile selects the maintained Telegram YAML scenarios; `all`
-adds opt-in session, usage, reply-chain, and streaming stress checks. Explicit
-`--scenario` values override the profile.
+The `release` profile selects taxonomy-owned Telegram scenarios that declare
+the channel, use the flow execution kind, and match the requested provider and
+model lane. Explicit `--scenario` values narrow that same selection instead of
+bypassing its constraints. Use `pnpm openclaw qa telegram --list-scenarios
+--provider-mode mock-openai` to print the current selection with regression
+refs. Supplying `--model` applies the same model constraint to listing and
+execution.
 
-- `channel-canary`
-- `channel-mention-gating`
-- `telegram-help-command`
-- `telegram-commands-command`
-- `telegram-tools-compact-command`
-- `telegram-whoami-command`
-- `telegram-status-command`
-- `telegram-repeated-command-authorization`
-- `telegram-other-bot-command-gating`
-- `telegram-context-command`
-- `telegram-current-session-status-tool`
-- `telegram-tool-only-usage-footer`
-- `telegram-reply-chain-exact-marker`
-- `telegram-stream-final-single-message`
-- `telegram-long-final-reuses-preview`
-- `telegram-long-final-three-chunks`
-
-The `release` profile always covers canary, mention gating, native command
-replies, command addressing, and bot-to-bot group replies. `mock-openai`
-also includes the deterministic long-final preview check.
-`telegram-current-session-status-tool` and
-`telegram-tool-only-usage-footer` remain opt-in: the former is only stable
-when threaded directly after canary, and the latter is a real-Telegram proof
-of the `/usage` footer on tool-only replies. Use `pnpm openclaw qa telegram
---list-scenarios --provider-mode mock-openai` to print the current
-default/optional split with regression refs. Use `--profile all` for every
-Telegram live-adapter scenario.
+`telegram-startup-getme-live` is a catalog script producer, not a live-adapter
+flow. Run it through `qa suite --scenario telegram-startup-getme-live`; the
+dedicated `qa telegram` command and `--list-scenarios` intentionally omit it.
 
 Output artifacts:
 
@@ -660,6 +641,8 @@ Slack YAML module scenarios (`qa/scenarios/channels/slack-*.yaml`):
 
 - `slack-canary`
 - `slack-mention-gating`
+- `slack-mpim-app-mention-dedupe` - opens a real C-prefixed group DM, sends one
+  mention, verifies exactly one SUT reply in that MPIM, then closes it.
 - `slack-allowlist-block`
 - `slack-channel-disabled-warning` - opt-in real-Slack probe that confirms a
   configured disabled channel emits a structured warning without replying.
@@ -1004,11 +987,10 @@ WhatsApp YAML scenarios (`qa/scenarios/channels/whatsapp-*.yaml`):
 - Status reactions: `whatsapp-status-reactions`,
   `whatsapp-status-reaction-lifecycle`.
 
-The catalog currently contains 52 scenarios. The `live-frontier` default lane
-is kept small at 8 scenarios for fast smoke coverage. The `mock-openai`
-default lane runs 39 scenarios deterministically through the real WhatsApp
-transport while mocking only model output; approval scenarios and a few
-heavier/blocking checks remain explicit by scenario id.
+WhatsApp defaults are derived from the selected taxonomy profile and lane
+constraints. `mock-openai` runs eligible scenarios deterministically through
+the real WhatsApp transport while mocking only model output; `live-frontier`
+excludes scenarios whose provider or model contract requires the mock lane.
 
 The WhatsApp QA driver observes structured live events (`text`, `media`,
 `location`, `reaction`, and `poll`) and can actively send media, polls,
