@@ -450,15 +450,57 @@ listener, repeat the ready message briefly until the connection arrives.
 The parent then connects by transferring a
 `MessagePort` in an `openclaw.pluginUi.connect` message. The message includes
 the declared capabilities plus the active `sessionKey` and, when known,
-`contextTokens`. Invoke an allowed action on that port:
+`contextTokens`. Receive and start that port before invoking an action:
 
 ```javascript
-port.postMessage({
-  v: 1,
-  type: "openclaw.pluginUi.sessionAction",
-  id: "append-1",
-  actionId: "append-entry",
-  payload: { text: "Ship the narrow bridge" },
+const announceReady = () => {
+  window.parent.postMessage({ v: 1, type: "openclaw.pluginUi.ready" }, "*");
+};
+
+let readyTimer;
+const connectedPort = new Promise((resolve) => {
+  const handleConnect = (event) => {
+    if (
+      event.source !== window.parent ||
+      event.data?.v !== 1 ||
+      event.data.type !== "openclaw.pluginUi.connect"
+    ) {
+      return;
+    }
+    const port = event.ports[0];
+    if (!port) {
+      return;
+    }
+    window.removeEventListener("message", handleConnect);
+    window.clearInterval(readyTimer);
+    port.addEventListener("message", (event) => {
+      if (event.data?.v === 1 && event.data.type === "openclaw.pluginUi.response") {
+        console.log("Plugin UI response", event.data);
+      }
+    });
+    port.start();
+    resolve(port);
+  };
+
+  window.addEventListener("message", handleConnect);
+});
+
+announceReady();
+readyTimer = window.setInterval(announceReady, 250);
+window.setTimeout(() => window.clearInterval(readyTimer), 5_000);
+```
+
+Invoke an allowed action after the connection arrives:
+
+```javascript
+void connectedPort.then((port) => {
+  port.postMessage({
+    v: 1,
+    type: "openclaw.pluginUi.sessionAction",
+    id: "append-1",
+    actionId: "append-entry",
+    payload: { text: "Ship the narrow bridge" },
+  });
 });
 ```
 
