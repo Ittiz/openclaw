@@ -259,4 +259,68 @@ describe("PluginUiBridgeController", () => {
     connected.bridge.clear();
     connected.childPort.close();
   });
+
+  it("retires the prior tab port before granting the replacement tab capabilities", async () => {
+    const connected = await connectBridge({ sessionActions: ["save"] });
+    const replacementRequest = vi.fn(async () => ({ ok: true }));
+    connected.bridge.sync({
+      frame: connected.frame,
+      key: "calendar/settings",
+      pluginId: "calendar",
+      client: { request: replacementRequest } as unknown as GatewayBrowserClient,
+      connected: true,
+      sessionKey: "agent:main:replacement",
+      sessionActions: ["save"],
+      allowChatNavigation: false,
+      navigateToChat: vi.fn(),
+    });
+
+    connected.childPort.postMessage({
+      v: 1,
+      type: "openclaw.pluginUi.sessionAction",
+      id: "retired-save",
+      actionId: "save",
+    });
+    window.dispatchEvent(
+      new MessageEvent("message", {
+        data: { v: 1, type: "openclaw.pluginUi.ready" },
+        source: connected.frame.contentWindow,
+      }),
+    );
+
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, 50);
+    });
+    expect(replacementRequest).not.toHaveBeenCalled();
+    expect(connected.postMessage).toHaveBeenCalledOnce();
+
+    connected.frame.dispatchEvent(new Event("load"));
+    await vi.waitFor(() => expect(connected.postMessage).toHaveBeenCalledTimes(2));
+    const replacementConnect = connected.postMessage.mock.calls[1] as unknown as [
+      Record<string, unknown>,
+      string,
+      MessagePort[],
+    ];
+    const ports = replacementConnect[2];
+    const replacementPort = ports[0];
+    if (!replacementPort) {
+      throw new Error("expected replacement bridge port");
+    }
+    replacementPort.postMessage({
+      v: 1,
+      type: "openclaw.pluginUi.sessionAction",
+      id: "replacement-save",
+      actionId: "save",
+    });
+    await vi.waitFor(() =>
+      expect(replacementRequest).toHaveBeenCalledWith("plugins.sessionAction", {
+        pluginId: "calendar",
+        actionId: "save",
+        sessionKey: "agent:main:replacement",
+      }),
+    );
+    connected.bridge.clear();
+    connected.childPort.close();
+    replacementPort.close();
+  });
 });

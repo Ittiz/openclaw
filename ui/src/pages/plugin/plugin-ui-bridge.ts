@@ -51,7 +51,7 @@ export class PluginUiBridgeController {
   private loadHandler: (() => void) | null = null;
   private readyHandler: ((event: MessageEvent) => void) | null = null;
   private connectTimer: ReturnType<typeof setTimeout> | null = null;
-  private observedInitialLoad = false;
+  private loadState: "initial" | "active" | "replacement" = "initial";
 
   sync(target: PluginUiBridgeTarget | null) {
     if (!target) {
@@ -59,7 +59,7 @@ export class PluginUiBridgeController {
       return;
     }
     const currentTarget = this.target;
-    if (currentTarget?.frame === target.frame) {
+    if (currentTarget?.frame === target.frame && currentTarget.key === target.key) {
       // Keep object identity stable for the active port listener while
       // refreshing callback/client references from the latest UI context.
       // UI snapshots can also refine session context after the first action
@@ -70,11 +70,20 @@ export class PluginUiBridgeController {
       return;
     }
 
+    const reusesFrameForAnotherTab = currentTarget?.frame === target.frame;
     this.clear();
     this.target = target;
+    this.loadState = reusesFrameForAnotherTab ? "replacement" : "initial";
     this.loadHandler = () => {
-      if (!this.observedInitialLoad) {
-        this.observedInitialLoad = true;
+      if (this.loadState === "replacement") {
+        // Lit reuses the iframe element across plugin routes. Do not let the
+        // retiring document reacquire a port carrying the next tab's grant.
+        this.loadState = "active";
+        this.scheduleConnect();
+        return;
+      }
+      if (this.loadState === "initial") {
+        this.loadState = "active";
         // A child can announce readiness before its initial iframe load event
         // reaches the parent. Keep the port established by that ready message;
         // only later loads represent a replacement document.
@@ -93,6 +102,7 @@ export class PluginUiBridgeController {
     this.readyHandler = (event: MessageEvent) => {
       const data = parsePluginUiBridgeMessage(event.data);
       if (
+        this.loadState !== "replacement" &&
         this.target?.frame === target.frame &&
         event.source === target.frame.contentWindow &&
         data?.v === 1 &&
@@ -242,6 +252,6 @@ export class PluginUiBridgeController {
     this.loadHandler = null;
     this.readyHandler = null;
     this.connectTimer = null;
-    this.observedInitialLoad = false;
+    this.loadState = "initial";
   }
 }
