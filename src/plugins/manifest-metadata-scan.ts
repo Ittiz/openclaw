@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { normalizeOptionalString as normalizeTrimmedString } from "@openclaw/normalization-core/string-coerce";
+import { resolveRealpathOrAbsolute } from "../infra/boundary-path.js";
 import { resolveHomeRelativePath } from "../infra/home-dir.js";
 import { resolveOpenClawPackageRootSync } from "../infra/openclaw-root.js";
 import { readRegularFileSync } from "../infra/regular-file.js";
@@ -11,6 +12,7 @@ import { parseJsonWithJson5Fallback } from "../utils/parse-json-compat.js";
 import { resolveBundledPluginsDir } from "./bundled-dir.js";
 import { resolveDefaultPluginExtensionsDir } from "./install-paths.js";
 import { readPersistedInstalledPluginIndexSync } from "./installed-plugin-index-store.js";
+import { registerPluginMetadataProcessMemoLifecycleClear } from "./plugin-metadata-lifecycle.js";
 
 // Plugin manifest files are small metadata descriptors. Bound reads to prevent
 // a corrupted or hostile manifest from exhausting memory during metadata scan.
@@ -32,12 +34,15 @@ type CandidateDir = {
 };
 
 const PLUGIN_MANIFEST_FILENAME = "openclaw.plugin.json";
-let manifestMetadataCache:
-  | {
-      key: string;
-      records: PluginManifestMetadataRecord[];
-    }
-  | undefined;
+let manifestMetadataCache = new WeakMap<NodeJS.ProcessEnv, PluginManifestMetadataRecord[]>();
+
+function clearManifestMetadataCache(): void {
+  manifestMetadataCache = new WeakMap();
+}
+
+// Manifest metadata is process-stable; install/reload owners refresh it only
+// through the shared plugin metadata lifecycle boundary.
+registerPluginMetadataProcessMemoLifecycleClear(clearManifestMetadataCache);
 
 function listChildPluginDirs(
   root: string | undefined,
@@ -51,7 +56,10 @@ function listChildPluginDirs(
   const dirs: CandidateDir[] = [];
   let order = startOrder;
   try {
-    for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
+    const entries = fs
+      .readdirSync(root, { withFileTypes: true })
+      .toSorted((left, right) => (left.name < right.name ? -1 : left.name > right.name ? 1 : 0));
+    for (const entry of entries) {
       if (entry.isDirectory()) {
         dirs.push({ pluginDir: path.join(root, entry.name), rank, order: order++, origin });
       }
@@ -82,16 +90,6 @@ function readJsonObject(filePath: string): Record<string, unknown> | undefined {
 
 function readManifestObject(pluginDir: string): Record<string, unknown> | undefined {
   return readJsonObject(path.join(pluginDir, PLUGIN_MANIFEST_FILENAME));
-}
-
-function manifestFileFingerprint(pluginDir: string): string {
-  const manifestPath = path.join(pluginDir, PLUGIN_MANIFEST_FILENAME);
-  try {
-    const stat = fs.statSync(manifestPath);
-    return `${manifestPath}:${stat.mtimeMs}:${stat.size}`;
-  } catch {
-    return `${manifestPath}:missing`;
-  }
 }
 
 function listPersistedIndexPluginDirs(env: NodeJS.ProcessEnv, startOrder: number): CandidateDir[] {
@@ -152,18 +150,10 @@ function listSourceCheckoutPluginDirs(startOrder: number): CandidateDir[] {
   return dirs;
 }
 
-function resolveComparablePath(filePath: string): string {
-  try {
-    return fs.realpathSync(filePath);
-  } catch {
-    return path.resolve(filePath);
-  }
-}
-
 function uniqueCandidateDirs(candidates: CandidateDir[]): CandidateDir[] {
   const byPath = new Map<string, CandidateDir>();
   for (const candidate of candidates) {
-    const key = resolveComparablePath(candidate.pluginDir);
+    const key = resolveRealpathOrAbsolute(candidate.pluginDir);
     const existing = byPath.get(key);
     if (!existing || candidate.rank < existing.rank || candidate.order < existing.order) {
       byPath.set(key, candidate);
@@ -178,6 +168,10 @@ function uniqueCandidateDirs(candidates: CandidateDir[]): CandidateDir[] {
 export function listOpenClawPluginManifestMetadata(
   env: NodeJS.ProcessEnv = process.env,
 ): PluginManifestMetadataRecord[] {
+  const cached = manifestMetadataCache.get(env);
+  if (cached) {
+    return cached.slice();
+  }
   const candidates: CandidateDir[] = [];
   let order = 0;
   candidates.push(...listPersistedIndexPluginDirs(env, order));
@@ -189,21 +183,7 @@ export function listOpenClawPluginManifestMetadata(
   candidates.push(
     ...listChildPluginDirs(resolveDefaultPluginExtensionsDir(env), 4, order, "global"),
   );
-
   const uniqueCandidates = uniqueCandidateDirs(candidates);
-  const cacheKey = JSON.stringify(
-    uniqueCandidates.map((candidate) => [
-      candidate.pluginDir,
-      candidate.rank,
-      candidate.order,
-      candidate.origin ?? "",
-      manifestFileFingerprint(candidate.pluginDir),
-    ]),
-  );
-  if (manifestMetadataCache?.key === cacheKey) {
-    return manifestMetadataCache.records.slice();
-  }
-
   const byManifestId = new Map<string, CandidateDir>();
   const records: PluginManifestMetadataRecord[] = [];
   for (const candidate of uniqueCandidates) {
@@ -221,6 +201,6 @@ export function listOpenClawPluginManifestMetadata(
     }
     records.push({ pluginDir: candidate.pluginDir, manifest, origin: candidate.origin });
   }
-  manifestMetadataCache = { key: cacheKey, records };
-  return records;
+  manifestMetadataCache.set(env, records);
+  return records.slice();
 }

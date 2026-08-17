@@ -22,9 +22,11 @@ import {
   type JsonSchemaValue,
 } from "../../plugins/schema-validator.js";
 import { ADMIN_SCOPE, READ_SCOPE, WRITE_SCOPE } from "../operator-scopes.js";
+import { resolveRequestedSessionAgentId } from "../session-request-agent.js";
+import { resolveStoredSessionKeyForAgentStore } from "../session-store-key.js";
 import {
   buildGatewaySessionInfo,
-  resolveFreshestSessionEntryFromStoreKeys,
+  resolveCanonicalSessionEntryFromStoreKeys,
   resolveGatewaySessionStoreTargetWithStore,
 } from "../session-utils.js";
 import type { GatewayRequestContext, GatewayRequestHandlers } from "./types.js";
@@ -39,6 +41,7 @@ function formatSessionActionPayloadSchemaErrors(errors: JsonSchemaValidationErro
 function resolveSessionActionContextTokens(
   context: GatewayRequestContext,
   sessionKey: string | undefined,
+  agentId: string | undefined,
 ): number | undefined {
   if (!sessionKey) {
     return undefined;
@@ -47,12 +50,13 @@ function resolveSessionActionContextTokens(
   const target = resolveGatewaySessionStoreTargetWithStore({
     cfg,
     key: sessionKey,
+    ...(agentId ? { agentId } : {}),
     clone: false,
     readOnly: true,
     exactRead: true,
   });
-  const entry = resolveFreshestSessionEntryFromStoreKeys(target.store, target.storeKeys);
-  const sessionContextTokens = buildGatewaySessionInfo({
+  const entry = resolveCanonicalSessionEntryFromStoreKeys(target.store, target.storeKeys);
+  return buildGatewaySessionInfo({
     cfg,
     storePath: target.storePath,
     store: target.store,
@@ -60,19 +64,6 @@ function resolveSessionActionContextTokens(
     entry,
     agentId: target.agentId,
   }).contextTokens;
-  if (
-    typeof sessionContextTokens === "number" &&
-    Number.isFinite(sessionContextTokens) &&
-    sessionContextTokens > 0
-  ) {
-    return sessionContextTokens;
-  }
-  const defaultContextTokens = cfg.agents?.defaults?.contextTokens;
-  return typeof defaultContextTokens === "number" &&
-    Number.isFinite(defaultContextTokens) &&
-    defaultContextTokens > 0
-    ? defaultContextTokens
-    : undefined;
 }
 
 /** Ensures plugin action result extension fields stay JSON-compatible on the wire. */
@@ -153,7 +144,26 @@ export const pluginHostHookHandlers: GatewayRequestHandlers = {
     }
     const pluginId = normalizeOptionalString(params.pluginId);
     const actionId = normalizeOptionalString(params.actionId);
-    const sessionKey = normalizeOptionalString(params.sessionKey);
+    const rawSessionKey = normalizeOptionalString(params.sessionKey);
+    const sessionOwner = rawSessionKey
+      ? resolveRequestedSessionAgentId(
+          context.getRuntimeConfig(),
+          rawSessionKey,
+          normalizeOptionalString(params.agentId),
+        )
+      : undefined;
+    if (sessionOwner && !sessionOwner.ok) {
+      respond(false, undefined, sessionOwner.error);
+      return;
+    }
+    const sessionKey =
+      rawSessionKey && sessionOwner?.ok
+        ? resolveStoredSessionKeyForAgentStore({
+            cfg: context.getRuntimeConfig(),
+            agentId: sessionOwner.agentId,
+            sessionKey: rawSessionKey,
+          })
+        : undefined;
     if (!pluginId || !actionId) {
       respond(
         false,
@@ -247,11 +257,13 @@ export const pluginHostHookHandlers: GatewayRequestHandlers = {
           return;
         }
       }
-      const contextTokens = resolveSessionActionContextTokens(context, sessionKey);
+      const agentId = sessionOwner?.ok ? sessionOwner.agentId : undefined;
+      const contextTokens = resolveSessionActionContextTokens(context, sessionKey, agentId);
       const result = await registration.action.handler({
         pluginId,
         actionId,
         ...(sessionKey ? { sessionKey } : {}),
+        ...(agentId ? { agentId } : {}),
         ...(contextTokens ? { contextTokens } : {}),
         ...(params.payload !== undefined ? { payload: params.payload } : {}),
         client: {

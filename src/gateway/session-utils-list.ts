@@ -5,13 +5,12 @@ import {
 } from "@openclaw/normalization-core/string-coerce";
 import type { SessionsListParams } from "../../packages/gateway-protocol/src/index.js";
 import { readAcpSessionMetaBatch } from "../acp/runtime/session-meta.js";
-import { resolveDefaultAgentId } from "../agents/agent-scope.js";
 import type { ModelCatalogEntry } from "../agents/model-catalog.js";
 import {
   countActiveDescendantRuns,
   getSessionDisplaySubagentRunByChildSessionKey,
-} from "../agents/subagent-registry-read.js";
-import { shouldKeepSubagentRunChildLink } from "../agents/subagent-run-liveness.js";
+} from "../agents/subagents/registry/subagent-registry-read.js";
+import { shouldKeepSubagentRunChildLink } from "../agents/subagents/registry/subagent-run-liveness.js";
 import type { SessionEntry } from "../config/sessions.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { withPinnedActivePluginRegistryWorkspaceDir } from "../plugins/runtime-workspace-state.js";
@@ -22,8 +21,11 @@ import {
 } from "../routing/session-key.js";
 import { isCronRunSessionKey } from "../sessions/session-key-utils.js";
 import { type SessionEntryPair, sortAndLimitSessionEntries } from "./session-list-order.js";
-import { resolveStoredSessionKeyForAgentStore } from "./session-store-key.js";
-import { readSessionTitleFieldsFromTranscriptAsync as readScopedSessionTitleFieldsFromTranscriptAsync } from "./session-transcript-title-reader.js";
+import {
+  resolveSessionStoreAgentId,
+  resolveStoredSessionKeyForAgentStore,
+} from "./session-store-key.js";
+import { readSessionTitleFieldsFromTranscriptBatch as readScopedSessionTitleFieldsFromTranscriptBatch } from "./session-transcript-title-reader.js";
 import type {
   SessionActorProfileIdentity,
   SessionListRowContext,
@@ -32,6 +34,7 @@ import type {
 import {
   deriveSessionTitle,
   isFinitePositiveTimestamp,
+  isCurrentSessionChildOwner,
   shouldKeepStoreOnlyChildLink,
 } from "./session-utils-core.js";
 import { getSessionDefaults } from "./session-utils-model.js";
@@ -69,7 +72,9 @@ type ListSessionsFromStoreParams = {
   storePath: string;
   store: Record<string, SessionEntry>;
   modelCatalog?: ModelCatalogEntry[];
+  lightweightListRows?: boolean;
   opts: SessionsListParams;
+  involvingActorId?: string;
 };
 
 type SessionEntrySelection = {
@@ -82,12 +87,27 @@ type SessionEntrySelection = {
   hasMore: boolean;
 };
 
+function preferredCreatorIdentityValue(
+  current: string | undefined,
+  candidate: string | undefined,
+): string | undefined {
+  if (!current || !candidate) {
+    return current ?? candidate;
+  }
+  return candidate < current ? candidate : current;
+}
+
 function addSessionCreatorIdentity(
   creators: Map<string, { id: string; label?: string; avatarUrl?: string }>,
   entry: SessionEntry,
   userProfileIdentityById: Map<string, SessionActorProfileIdentity | undefined>,
+  cfg: OpenClawConfig,
 ): void {
-  const actor = projectSessionActor(entry.createdActor, userProfileIdentityById);
+  const actor = projectSessionActor(
+    entry.owner?.actor ?? entry.createdActor,
+    userProfileIdentityById,
+    cfg,
+  );
   const id = normalizeOptionalString(actor?.id);
   if (!id) {
     return;
@@ -95,15 +115,13 @@ function addSessionCreatorIdentity(
   const label = normalizeOptionalString(actor?.label);
   const avatarUrl = normalizeOptionalString(actor?.avatarUrl);
   const existing = creators.get(id);
-  if (
-    !existing ||
-    (label && (!existing.label || label.localeCompare(existing.label) < 0)) ||
-    (avatarUrl && !existing.avatarUrl)
-  ) {
+  const preferredLabel = preferredCreatorIdentityValue(existing?.label, label);
+  const preferredAvatarUrl = preferredCreatorIdentityValue(existing?.avatarUrl, avatarUrl);
+  if (!existing || preferredLabel !== existing.label || preferredAvatarUrl !== existing.avatarUrl) {
     creators.set(id, {
       id,
-      ...(label ? { label } : existing?.label ? { label: existing.label } : {}),
-      ...(avatarUrl ? { avatarUrl } : existing?.avatarUrl ? { avatarUrl: existing.avatarUrl } : {}),
+      ...(preferredLabel ? { label: preferredLabel } : {}),
+      ...(preferredAvatarUrl ? { avatarUrl: preferredAvatarUrl } : {}),
     });
   }
 }
@@ -129,9 +147,7 @@ function populateSessionListAcpMetadata(params: {
   const entries = params.entries.map(([key, entry]) => {
     const parsed = parseAgentSessionKey(key);
     const agentId = normalizeAgentId(
-      key === "global" && typeof params.opts.agentId === "string"
-        ? params.opts.agentId
-        : (parsed?.agentId ?? resolveDefaultAgentId(params.cfg)),
+      parsed?.agentId ?? params.opts.agentId ?? resolveSessionStoreAgentId(params.cfg, key),
     );
     return {
       sessionKey: resolveStoredSessionKeyForAgentStore({
@@ -139,10 +155,14 @@ function populateSessionListAcpMetadata(params: {
         agentId,
         sessionKey: key,
       }),
+      agentId,
       entry,
     };
   });
-  params.rowContext.acpSessionMetaByEntry = readAcpSessionMetaBatch({ entries });
+  params.rowContext.acpSessionMetaByEntry = readAcpSessionMetaBatch({
+    entries,
+    cfg: params.cfg,
+  });
 }
 
 function resolveSessionsListLimit(
@@ -178,6 +198,7 @@ function filterSessionEntries(params: {
   userProfileIdentityById?: Map<string, SessionActorProfileIdentity | undefined>;
   getRowContext?: SessionListRowContextProvider;
   entryFilter?: (key: string, entry: SessionEntry) => boolean;
+  involvingActorId?: string;
 }): Pick<SessionEntrySelection, "creators" | "entries"> {
   const { cfg, store, opts, now } = params;
   const includeGlobal = opts.includeGlobal === true;
@@ -192,6 +213,7 @@ function filterSessionEntries(params: {
       ? Math.max(1, Math.floor(opts.activeMinutes))
       : undefined;
   const creatorId = normalizeOptionalString(opts.creatorId);
+  const involvingActorId = normalizeOptionalString(params.involvingActorId);
   const activeCutoff = activeMinutes === undefined ? undefined : now - activeMinutes * 60_000;
   const entries: SessionEntryPair[] = [];
   const creators = new Map<string, { id: string; label?: string; avatarUrl?: string }>();
@@ -233,8 +255,13 @@ function filterSessionEntries(params: {
         ? filterRowContext.subagentRuns.getDisplaySubagentRun(key)
         : getSessionDisplaySubagentRunByChildSessionKey(key);
       const keepSpawned = latest
-        ? (normalizeOptionalString(latest.controllerSessionKey) ||
-            normalizeOptionalString(latest.requesterSessionKey)) === spawnedBy &&
+        ? isCurrentSessionChildOwner({
+            entry,
+            ownerSessionKey: spawnedBy,
+            controllerSessionKey:
+              normalizeOptionalString(latest.controllerSessionKey) ||
+              normalizeOptionalString(latest.requesterSessionKey),
+          }) &&
           shouldKeepSubagentRunChildLink(latest, {
             activeDescendants: filterRowContext
               ? filterRowContext.subagentRuns.countActiveDescendantRuns(key)
@@ -278,6 +305,7 @@ function filterSessionEntries(params: {
         shouldResolveDerivedSessionModelSearchFields(search) &&
         matchesSessionListSearch(
           resolveSessionListSearchModelFields({
+            ...(agentId ? { agentId } : {}),
             cfg,
             key,
             entry,
@@ -293,10 +321,25 @@ function filterSessionEntries(params: {
       continue;
     }
     if (params.userProfileIdentityById) {
-      addSessionCreatorIdentity(creators, entry, params.userProfileIdentityById);
+      addSessionCreatorIdentity(creators, entry, params.userProfileIdentityById, cfg);
     }
-    if (creatorId && entry.createdActor?.id !== creatorId) {
+    if (creatorId && (entry.owner?.actor ?? entry.createdActor)?.id !== creatorId) {
       continue;
+    }
+    if (involvingActorId) {
+      const owner = entry.owner?.actor ?? entry.createdActor;
+      const viewerOwns = owner?.type === "human" && owner.id === involvingActorId;
+      // Only profile-backed ids share the authenticated viewer namespace.
+      // Channel-native and legacy unknown ids remain display-only.
+      const viewerParticipates = entry.participants?.some(
+        (participant) =>
+          participant.type === "human" &&
+          participant.source === "profile" &&
+          participant.id === involvingActorId,
+      );
+      if (!viewerOwns && !viewerParticipates) {
+        continue;
+      }
     }
     entries.push([key, entry]);
   }
@@ -322,6 +365,7 @@ function selectSessionEntries(params: {
   defaultLimit?: number;
   userProfileIdentityById?: Map<string, SessionActorProfileIdentity | undefined>;
   entryFilter?: (key: string, entry: SessionEntry) => boolean;
+  involvingActorId?: string;
 }): SessionEntrySelection {
   const { creators, entries: filtered } = filterSessionEntries(params);
   const limit = resolveSessionsListLimit(params.opts, params.defaultLimit);
@@ -375,6 +419,7 @@ function prepareSessionList(params: ListSessionsFromStoreParams) {
         : undefined,
     defaultLimit: SESSIONS_LIST_DEFAULT_LIMIT,
     userProfileIdentityById,
+    involvingActorId: params.involvingActorId,
   });
   const fullRowContext =
     rowContext ||
@@ -416,6 +461,7 @@ function prepareSessionList(params: ListSessionsFromStoreParams) {
 
 function buildSessionsListResult(params: {
   cfg: OpenClawConfig;
+  agentId?: string;
   list: ReturnType<typeof prepareSessionList>;
   modelCatalog?: ModelCatalogEntry[];
   sessions: GatewaySessionRow[];
@@ -432,6 +478,7 @@ function buildSessionsListResult(params: {
     hasMore: list.hasMore,
     creators: list.creators,
     defaults: getSessionDefaults(params.cfg, params.modelCatalog, {
+      ...(params.agentId ? { agentId: params.agentId } : {}),
       allowPluginNormalization: false,
     }),
     sessions,
@@ -443,6 +490,7 @@ export function filterAndSortSessionEntries(params: {
   store: Record<string, SessionEntry>;
   opts: SessionsListParams;
   now: number;
+  involvingActorId?: string;
 }): [string, SessionEntry][] {
   return selectSessionEntries(params).entries;
 }
@@ -453,7 +501,7 @@ export function listSessionsFromStore(params: ListSessionsFromStoreParams): Sess
   const sessions = list.entries.map(([key, entry], index) => {
     const includeTranscriptFields = index < SESSIONS_LIST_TRANSCRIPT_FIELD_ROWS;
     const rowAgentId =
-      key === "global" && typeof opts.agentId === "string"
+      !parseAgentSessionKey(key) && typeof opts.agentId === "string"
         ? normalizeAgentId(opts.agentId)
         : undefined;
     const storeChildSessionsByKey =
@@ -478,9 +526,17 @@ export function listSessionsFromStore(params: ListSessionsFromStoreParams): Sess
       transcriptUsageMaxBytes: SESSIONS_LIST_TRANSCRIPT_USAGE_MAX_BYTES,
       storeChildSessionsByKey,
       rowContext: list.rowContext,
+      skipTranscriptUsageFallback: params.lightweightListRows === true,
+      lightweightListRow: params.lightweightListRows === true,
     });
   });
-  return buildSessionsListResult({ cfg, list, modelCatalog: params.modelCatalog, sessions });
+  return buildSessionsListResult({
+    cfg,
+    list,
+    modelCatalog: params.modelCatalog,
+    sessions,
+    agentId: opts.agentId,
+  });
 }
 
 /**
@@ -505,11 +561,33 @@ export async function listSessionsFromStoreAsync(
     const { cfg, store, opts } = params;
     const list = prepareSessionList(params);
     const sessions: GatewaySessionRow[] = [];
+    const transcriptScopes = list.entries
+      .slice(0, SESSIONS_LIST_TRANSCRIPT_FIELD_ROWS)
+      .flatMap(([key, entry]) => {
+        if (!entry.sessionId || (!list.includeDerivedTitles && !list.includeLastMessage)) {
+          return [];
+        }
+        const parsed = parseAgentSessionKey(key);
+        const agentId = normalizeAgentId(
+          parsed?.agentId ?? opts.agentId ?? resolveSessionStoreAgentId(cfg, key),
+        );
+        return [
+          {
+            agentId,
+            sessionEntry: entry,
+            sessionId: entry.sessionId,
+            sessionKey: key,
+            storePath: list.storePath,
+          },
+        ];
+      });
+    const transcriptFields = readScopedSessionTitleFieldsFromTranscriptBatch(transcriptScopes);
+    let transcriptFieldIndex = 0;
     for (let i = 0; i < list.entries.length; i++) {
       const [key, entry] = expectDefined(list.entries[i], "entries entry at i");
       const includeTranscriptFields = i < SESSIONS_LIST_TRANSCRIPT_FIELD_ROWS;
       const rowAgentId =
-        key === "global" && typeof opts.agentId === "string"
+        !parseAgentSessionKey(key) && typeof opts.agentId === "string"
           ? normalizeAgentId(opts.agentId)
           : undefined;
       const storeChildSessionsByKey =
@@ -542,17 +620,11 @@ export async function listSessionsFromStoreAsync(
         includeTranscriptFields &&
         (list.includeDerivedTitles || list.includeLastMessage)
       ) {
-        const parsed = parseAgentSessionKey(key);
-        const sessionAgentId =
-          rowAgentId ??
-          (parsed?.agentId ? normalizeAgentId(parsed.agentId) : resolveDefaultAgentId(cfg));
-        const fields = await readScopedSessionTitleFieldsFromTranscriptAsync({
-          agentId: sessionAgentId,
-          sessionEntry: entry,
-          sessionId: entry.sessionId,
-          sessionKey: key,
-          storePath: list.storePath,
-        });
+        const fields = expectDefined(
+          transcriptFields[transcriptFieldIndex],
+          "batched transcript fields at transcriptFieldIndex",
+        );
+        transcriptFieldIndex += 1;
         if (list.includeDerivedTitles) {
           row.derivedTitle = deriveSessionTitle(entry, fields.firstUserMessage, row.displayName);
         }
@@ -570,6 +642,12 @@ export async function listSessionsFromStoreAsync(
       }
     }
 
-    return buildSessionsListResult({ cfg, list, modelCatalog: params.modelCatalog, sessions });
+    return buildSessionsListResult({
+      cfg,
+      list,
+      modelCatalog: params.modelCatalog,
+      sessions,
+      agentId: opts.agentId,
+    });
   });
 }

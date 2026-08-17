@@ -123,7 +123,8 @@ export type PluginSessionActionContext = {
   pluginId: string;
   actionId: string;
   sessionKey?: string;
-  /** Active Control UI context window when supplied by an authenticated UI caller. */
+  agentId?: string;
+  /** Gateway-derived context window for the resolved session. */
   contextTokens?: number;
   payload?: PluginJsonValue;
   client?: {

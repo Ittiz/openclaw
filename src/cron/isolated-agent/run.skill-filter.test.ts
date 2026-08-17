@@ -1,4 +1,5 @@
 // Skill filter tests cover active skill selection for isolated cron runs.
+import { createRequireRecord } from "openclaw/plugin-sdk/test-fixtures";
 import { describe, expect, it } from "vitest";
 import { makeIsolatedAgentJobFixture, makeIsolatedAgentParamsFixture } from "./job-fixtures.js";
 import { setupRunCronIsolatedAgentTurnSuite } from "./run.suite-helpers.js";
@@ -7,7 +8,7 @@ import {
   dispatchCronDeliveryMock,
   getCliSessionBindingMock,
   isCliProviderMock,
-  lookupContextTokensMock,
+  resolveContextTokensForModelMock,
   loadRunCronIsolatedAgentTurn,
   logWarnMock,
   makeCronSession,
@@ -22,12 +23,7 @@ import {
 
 const runCronIsolatedAgentTurn = await loadRunCronIsolatedAgentTurn();
 
-function requireRecord(value: unknown, label: string): Record<string, unknown> {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) {
-    throw new Error(`expected ${label} to be an object`);
-  }
-  return value as Record<string, unknown>;
-}
+const requireRecord = createRequireRecord("record", "expected-label-object");
 
 function getMockCallArg(
   mock: { mock: { calls: readonly unknown[][] } },
@@ -271,7 +267,7 @@ describe("runCronIsolatedAgentTurn — skill filter", () => {
 
       expect(result.status).toBe("error");
       expect(result.error).toBe(
-        "cron payload.model 'anthropic/claude-sonnet-4-6' rejected by agents.defaults.modelPolicy.allow: anthropic/claude-sonnet-4-6 is not in [openai/gpt-5.4]",
+        "automation model override 'anthropic/claude-sonnet-4-6' rejected by agents.defaults.modelPolicy.allow: anthropic/claude-sonnet-4-6 is not in [openai/gpt-5.4]",
       );
       expect(logWarnMock).not.toHaveBeenCalled();
       expect(runWithModelFallbackMock).not.toHaveBeenCalled();
@@ -291,7 +287,9 @@ describe("runCronIsolatedAgentTurn — skill filter", () => {
       );
 
       expect(result.status).toBe("error");
-      expect(result.error).toBe("cron payload.model 'openai/' rejected: invalid model: openai/");
+      expect(result.error).toBe(
+        "automation model override 'openai/' rejected: invalid model: openai/",
+      );
       expect(logWarnMock).not.toHaveBeenCalled();
       expect(runWithModelFallbackMock).not.toHaveBeenCalled();
     });
@@ -411,7 +409,7 @@ describe("runCronIsolatedAgentTurn — skill filter", () => {
         }),
       });
       resolveCronSessionMock.mockReturnValue(session);
-      lookupContextTokensMock.mockReturnValue(undefined);
+      resolveContextTokensForModelMock.mockReturnValue(undefined);
 
       const result = await runSkillFilterCase();
 
@@ -426,13 +424,16 @@ describe("runCronIsolatedAgentTurn — skill filter", () => {
         }),
       });
       resolveCronSessionMock.mockReturnValue(session);
-      lookupContextTokensMock.mockReturnValue(512_000);
+      resolveContextTokensForModelMock.mockReturnValue(512_000);
 
       const result = await runSkillFilterCase();
 
       expect(result.status).toBe("ok");
       expect(session.sessionEntry.contextTokens).toBe(512_000);
-      expect(lookupContextTokensMock).toHaveBeenCalledWith("gpt-5.4", {
+      expect(resolveContextTokensForModelMock).toHaveBeenCalledWith({
+        cfg: expect.any(Object),
+        provider: "openai",
+        model: "gpt-5.4",
         allowAsyncLoad: false,
       });
     });

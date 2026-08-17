@@ -1,3 +1,4 @@
+import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import type { GatewayBrowserClient } from "../../api/gateway.ts";
 
 type PluginUiBridgeTarget = {
@@ -29,6 +30,10 @@ function normalizeMessageId(value: unknown): string {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : "Plugin UI action failed";
+}
+
+function parsePluginUiBridgeMessage(value: unknown): PluginUiBridgeMessage | null {
+  return isRecord(value) ? value : null;
 }
 
 /**
@@ -86,7 +91,7 @@ export class PluginUiBridgeController {
     };
     target.frame.addEventListener("load", this.loadHandler);
     this.readyHandler = (event: MessageEvent) => {
-      const data = event.data as { v?: unknown; type?: unknown } | null;
+      const data = parsePluginUiBridgeMessage(event.data);
       if (
         this.target?.frame === target.frame &&
         event.source === target.frame.contentWindow &&
@@ -131,7 +136,7 @@ export class PluginUiBridgeController {
       if (this.target !== target || this.port !== port) {
         return;
       }
-      const message = event.data as PluginUiBridgeMessage | null;
+      const message = parsePluginUiBridgeMessage(event.data);
       if (message?.v !== 1) {
         return;
       }

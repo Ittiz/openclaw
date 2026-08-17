@@ -13,11 +13,7 @@ import type { GatewayClient, RespondFn } from "../../gateway/server-methods/type
 import { onAgentEvent, resetAgentEventsForTest } from "../../infra/agent-events.js";
 import { createEmptyPluginRegistry } from "../registry-empty.js";
 import { createPluginRegistry } from "../registry.js";
-import {
-  pinActivePluginSessionExtensionRegistry,
-  releasePinnedPluginSessionExtensionRegistry,
-  setActivePluginRegistry,
-} from "../runtime.js";
+import { setActivePluginRegistry } from "../runtime.js";
 import { createPluginRecord } from "../status.test-fixtures.js";
 import type { OpenClawPluginApi } from "../types.js";
 
@@ -58,7 +54,14 @@ async function callPluginSessionActionForTest(params: {
     isWebchatConnect: () => false,
     respond,
     context: {
-      getRuntimeConfig: () => ({ agents: { defaults: { contextTokens: 64_000 } } }),
+      getRuntimeConfig: () => ({
+        agents: { defaults: { model: { primary: "openai/pr-bridge-test" } } },
+        models: {
+          providers: {
+            openai: { models: [{ id: "pr-bridge-test", contextTokens: 64_000 }] },
+          },
+        },
+      }),
     } as never,
   });
   return response ?? { ok: false, error: new Error("handler did not respond") };
@@ -159,7 +162,6 @@ function registerActionFixture(params: {
 
 describe("plugin session actions", () => {
   afterEach(() => {
-    releasePinnedPluginSessionExtensionRegistry();
     setActivePluginRegistry(createEmptyPluginRegistry());
     resetAgentEventsForTest();
   });
@@ -280,8 +282,14 @@ describe("plugin session actions", () => {
               version: { type: "string" },
             },
           },
-          handler: ({ payload, sessionKey, contextTokens, client }) => {
-            handlerCalls.push({ payload, sessionKey, contextTokens, scopes: client?.scopes ?? [] });
+          handler: ({ payload, sessionKey, agentId, contextTokens, client }) => {
+            handlerCalls.push({
+              payload,
+              sessionKey,
+              agentId,
+              contextTokens,
+              scopes: client?.scopes ?? [],
+            });
             return {
               result: { accepted: true, ...(sessionKey ? { sessionKey } : {}) },
               continueAgent: true,
@@ -341,6 +349,7 @@ describe("plugin session actions", () => {
       {
         payload: { version: "2026.05.01" },
         sessionKey: MAIN_SESSION_KEY,
+        agentId: "main",
         contextTokens: 64_000,
         scopes: [WRITE_SCOPE],
       },
@@ -626,58 +635,6 @@ describe("plugin session actions", () => {
       { scopes: [APPROVALS_SCOPE], sessionKey: MAIN_SESSION_KEY },
       { scopes: [READ_SCOPE], action: "view" },
     ]);
-  });
-
-  it("keeps session actions and their scopes pinned across agent registry replacement", async () => {
-    const gatewayHandler = vi.fn(() => ({ result: { owner: "gateway" } }));
-    const scopedHandler = vi.fn(() => ({ result: { owner: "agent" } }));
-    const { registry: gatewayRegistry } = registerActionFixture({
-      id: "pinned-action-fixture",
-      register(api) {
-        api.registerSessionAction({
-          id: "approve",
-          requiredScopes: [APPROVALS_SCOPE],
-          handler: gatewayHandler,
-        });
-      },
-    });
-    const { registry: scopedRegistry } = registerActionFixture({
-      id: "pinned-action-fixture",
-      register(api) {
-        api.registerSessionAction({
-          id: "approve",
-          requiredScopes: [READ_SCOPE],
-          handler: scopedHandler,
-        });
-      },
-    });
-    setActivePluginRegistry(gatewayRegistry.registry);
-    pinActivePluginSessionExtensionRegistry(gatewayRegistry.registry);
-    setActivePluginRegistry(scopedRegistry.registry);
-
-    await expect(
-      callRegisteredSessionActionThroughGatewayForTest({
-        pluginId: "pinned-action-fixture",
-        actionId: "approve",
-        scopes: [APPROVALS_SCOPE],
-      }),
-    ).resolves.toEqual({
-      ok: true,
-      payload: { ok: true, result: { owner: "gateway" } },
-      error: undefined,
-    });
-
-    const denied = await callRegisteredSessionActionThroughGatewayForTest({
-      pluginId: "pinned-action-fixture",
-      actionId: "approve",
-      scopes: [READ_SCOPE],
-    });
-    expect(requireHookError(denied)).toMatchObject({
-      code: "FORBIDDEN",
-      message: `missing scope: ${APPROVALS_SCOPE}`,
-    });
-    expect(gatewayHandler).toHaveBeenCalledOnce();
-    expect(scopedHandler).not.toHaveBeenCalled();
   });
 
   it("passes a defensive copy of client scopes to session action handlers", async () => {

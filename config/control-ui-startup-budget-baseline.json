@@ -1,5 +1,5 @@
 {
-  "startupJsGzipBytes": 324587,
-  "reason": "multi-gateway footer subtitle plus accumulated main drift (PR #114059), then the Memory settings surface: its i18n strings plus the rendering-free memory-schema facts settings search reads at startup",
-  "updatedAt": "2026-07-26"
+  "startupJsGzipBytes": 339585,
+  "reason": "Startup growth reflects session placement move controls, ownership chips, assignment menus, participant stack, cloud worker settings navigation and machine selection, plus the session permission picker (five-option menu with Default), permission chip, and guardian review notices joining the startup chat composer path.",
+  "updatedAt": "2026-08-17"
 }

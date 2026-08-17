@@ -41,11 +41,6 @@ import { isDiagnosticFlagEnabled } from "../../infra/diagnostic-flags.js";
 import { applyModelOverrideToSessionEntry } from "../../sessions/model-overrides.js";
 import { createLazyImportLoader } from "../../shared/lazy-promise.js";
 import { normalizeThinkLevel, type ThinkLevel } from "../thinking.shared.js";
-export {
-  resolveModelDirectiveSelection,
-  type ModelDirectiveSelection,
-} from "./model-selection-directive.js";
-export { resolveContextTokens } from "./model-selection-context.js";
 import { normalizeRuntimeRef, resolveRuntimeNormalization } from "./model-runtime-normalization.js";
 import {
   isStaleHeartbeatAutoFallbackOverride,
@@ -53,6 +48,11 @@ import {
   resolveDirectStoredModelOverride,
   resolveStoredModelOverride,
 } from "./stored-model-override.js";
+export {
+  resolveModelDirectiveSelection,
+  type ModelDirectiveSelection,
+} from "./model-selection-directive.js";
+export { resolveContextTokens } from "./model-selection-context.js";
 
 type ModelCatalog = ModelCatalogEntry[];
 
@@ -211,6 +211,7 @@ export async function createModelSelectionState(params: {
   const primaryProvider = params.primaryProvider ?? defaultProvider;
   const primaryModel = params.primaryModel ?? defaultModel;
   const hasOneTurnModelOverride = params.hasOneTurnModelOverride === true;
+  const modelSelectionLocked = sessionEntry?.modelSelectionLocked === true;
   const agentEntry = params.agentId ? resolveAgentConfig(cfg, params.agentId) : undefined;
 
   let visibilityPolicy: ModelVisibilityPolicy = createModelVisibilityPolicy({
@@ -361,12 +362,14 @@ export async function createModelSelectionState(params: {
     const overrideAllowed = visibilityPolicy.allowsKey(key);
     // A degraded catalog cannot prove a pin is disallowed. Preserve it while the turn falls back
     // to primary, then re-evaluate after discovery recovers; config-proven stale pins still reset.
+    const shouldResetOverride =
+      (staleDirectStoredOverride || !overrideAllowed) && !modelSelectionLocked;
     const overrideTemporarilyUnavailable =
-      !staleDirectStoredOverride && !overrideAllowed && !catalogAuthoritative;
+      shouldResetOverride && !staleDirectStoredOverride && !catalogAuthoritative;
     if (overrideTemporarilyUnavailable) {
       resetModelOverrideRef = key;
       resetModelOverrideReason = "temporarily-unavailable";
-    } else if (staleDirectStoredOverride || !overrideAllowed) {
+    } else if (shouldResetOverride) {
       const initialSessionEntry = { ...sessionEntry };
       const nextSessionEntry = { ...sessionEntry };
       const { updated } = applyModelOverrideToSessionEntry({
@@ -466,7 +469,7 @@ export async function createModelSelectionState(params: {
       runtimeModelNormalization,
     );
     const key = modelKey(normalizedStoredOverride.provider, normalizedStoredOverride.model);
-    if (visibilityPolicy.allowsKey(key)) {
+    if (modelSelectionLocked || visibilityPolicy.allowsKey(key)) {
       provider = normalizedStoredOverride.provider;
       model = normalizedStoredOverride.model;
       requestedRouteResolution =
@@ -474,7 +477,9 @@ export async function createModelSelectionState(params: {
     }
   }
 
-  if (!params.hasModelDirective && !hasOneTurnModelOverride) {
+  const skipResolveSelection =
+    params.hasModelDirective || hasOneTurnModelOverride || modelSelectionLocked;
+  if (!skipResolveSelection) {
     const unresolvedSelectionKey = modelKey(provider, model);
     const allowedInitialSelection = visibilityPolicy.resolveSelection({
       provider,

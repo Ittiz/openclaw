@@ -134,12 +134,30 @@ describeControlUiE2e("Control UI Custodian channel onboarding mocked Gateway E2E
         path: path.join(artifactDir, "01-after-model-ready-continue-setup.png"),
       });
 
+      await gateway.deferNext("channels.status", { probe: false });
       await continueSetup.click();
       await waitForControlUiRoute(page, {
         pathname: "/custodian",
         routeId: "custodian",
         search: "?onboarding=1",
       });
+      await gateway.waitForRequest("channels.status");
+      await gateway.rejectDeferred("channels.status", {
+        code: "UNAVAILABLE",
+        message: "channel status temporarily unavailable",
+        retryable: true,
+      });
+      const channelStatusError = page.getByRole("alert").filter({
+        hasText: "Channel status is unavailable",
+      });
+      await channelStatusError.waitFor();
+      await page.screenshot({
+        animations: "disabled",
+        path: path.join(artifactDir, "02-channel-status-error-before-retry.png"),
+      });
+
+      await gateway.setMethodResponse("channels.status", emptyChannelSnapshot);
+      await channelStatusError.getByRole("button", { name: "Retry" }).click();
       const channelNudge = page.locator(".custodian__nudge--channel-onboarding");
       await channelNudge.waitFor();
       await expect.poll(() => channelNudge.textContent()).toContain("The web app already works");
@@ -149,21 +167,35 @@ describeControlUiE2e("Control UI Custodian channel onboarding mocked Gateway E2E
       });
 
       await page.setViewportSize({ height: 844, width: 390 });
-      const mobileNudgeBox = await channelNudge.boundingBox();
-      const mobileCtaBox = await page
-        .getByRole("button", { name: "Set up a channel" })
-        .boundingBox();
-      expect(mobileNudgeBox).not.toBeNull();
-      expect(mobileCtaBox).not.toBeNull();
-      expect(mobileNudgeBox!.x).toBeGreaterThanOrEqual(0);
-      expect(mobileNudgeBox!.x + mobileNudgeBox!.width).toBeLessThanOrEqual(390);
-      expect(mobileCtaBox!.x).toBeGreaterThanOrEqual(mobileNudgeBox!.x);
-      expect(mobileCtaBox!.x + mobileCtaBox!.width).toBeLessThanOrEqual(
-        mobileNudgeBox!.x + mobileNudgeBox!.width,
-      );
-      expect(
-        await page.evaluate(() => document.documentElement.scrollWidth > window.innerWidth),
-      ).toBe(false);
+      await expect
+        .poll(() =>
+          channelNudge.evaluate((nudge) => {
+            const cta = nudge.querySelector<HTMLElement>(".custodian__nudge-cta");
+            if (!cta) {
+              return null;
+            }
+            const nudgeBox = nudge.getBoundingClientRect();
+            const ctaBox = cta.getBoundingClientRect();
+            return {
+              ctaVisible: ctaBox.width > 0 && ctaBox.height > 0,
+              mobileMediaQuery: window.matchMedia("(max-width: 640px)").matches,
+              noHorizontalOverflow: document.documentElement.scrollWidth <= window.innerWidth,
+              nudgeVisible: nudgeBox.width > 0 && nudgeBox.height > 0,
+              nudgeWithinViewport: nudgeBox.left >= 0 && nudgeBox.right <= window.innerWidth,
+              ctaWithinNudge: ctaBox.left >= nudgeBox.left && ctaBox.right <= nudgeBox.right,
+              viewportWidth: window.innerWidth,
+            };
+          }),
+        )
+        .toEqual({
+          ctaVisible: true,
+          mobileMediaQuery: true,
+          noHorizontalOverflow: true,
+          nudgeVisible: true,
+          nudgeWithinViewport: true,
+          ctaWithinNudge: true,
+          viewportWidth: 390,
+        });
       await page.screenshot({
         animations: "disabled",
         path: path.join(artifactDir, "02b-after-custodian-channel-nudge-mobile.png"),
@@ -171,8 +203,9 @@ describeControlUiE2e("Control UI Custodian channel onboarding mocked Gateway E2E
       await page.setViewportSize({ height: 900, width: 1280 });
 
       const channelStatusRequests = await gateway.getRequests("channels.status");
-      expect(channelStatusRequests).toHaveLength(1);
+      expect(channelStatusRequests).toHaveLength(2);
       expect(channelStatusRequests[0]?.params).toMatchObject({ probe: false });
+      expect(channelStatusRequests[1]?.params).toMatchObject({ probe: false });
 
       await page.getByRole("button", { name: "Set up a channel" }).click();
       await waitForControlUiRoute(page, {
