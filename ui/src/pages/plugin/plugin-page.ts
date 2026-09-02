@@ -695,7 +695,8 @@ export class PluginPage extends OpenClawLightDomContentsElement {
       }
       const sandbox = resolveEmbedSandbox(context.config.current.embedSandboxMode);
       const bridgeEnabled =
-        (info.sessionActions?.length ?? 0) > 0 || info.allowChatNavigation === true;
+        info.requiresGatewayAuth === true &&
+        ((info.sessionActions?.length ?? 0) > 0 || info.allowChatNavigation === true);
       return html`
         <section class="plugin-tab-embed">
           ${this.pluginUiFrame.resolve({

@@ -428,10 +428,37 @@ describe("PluginPage", () => {
     }
   });
 
+  it("keeps action-capable plugin-auth panels on their direct iframe path", async () => {
+    const fetchPluginDocument = vi.spyOn(globalThis, "fetch");
+    const refresh = vi.fn(async () => externalPluginConfig());
+    const page = createExternalPluginPage(refresh, false);
+    const context = (page as unknown as { context: ApplicationContext<RouteId> }).context;
+    const tab = context.gateway.snapshot.hello?.controlUiTabs?.[0];
+    if (!tab) {
+      throw new Error("expected external plugin tab");
+    }
+    tab.sessionActions = ["list-sessions"];
+    tab.allowChatNavigation = true;
+
+    document.body.append(page);
+    try {
+      await waitForFast(() =>
+        expect(page.querySelector("iframe")?.getAttribute("src")).toBe("/plugins/external/panel"),
+      );
+      const frame = page.querySelector("iframe");
+      expect(refresh).not.toHaveBeenCalled();
+      expect(fetchPluginDocument).not.toHaveBeenCalled();
+      expect(frame?.srcdoc).toBe("");
+      expect(pluginUiBridgeNonce(frame)).toBeUndefined();
+    } finally {
+      page.remove();
+    }
+  });
+
   it("remounts an external frame when its document identity changes", async () => {
     const fetchPluginDocument = mockPluginUiDocuments();
     const refresh = vi.fn(async () => externalPluginConfig());
-    const page = createExternalPluginPage(refresh, false);
+    const page = createExternalPluginPage(refresh);
     const context = (page as unknown as { context: ApplicationContext<RouteId> }).context;
     const tab = context.gateway.snapshot.hello?.controlUiTabs?.[0];
     if (!tab) {
@@ -490,7 +517,7 @@ describe("PluginPage", () => {
       .mockRejectedValue(new TypeError("redirect mode is set to error"));
     const page = createExternalPluginPage(
       vi.fn(async () => externalPluginConfig()),
-      false,
+      true,
     );
     const context = (page as unknown as { context: ApplicationContext<RouteId> }).context;
     const tab = context.gateway.snapshot.hello?.controlUiTabs?.[0];
@@ -630,7 +657,7 @@ describe("PluginPage", () => {
   it("exposes a connected gateway to external plugin session actions", async () => {
     mockPluginUiDocuments();
     const refresh = vi.fn(async () => externalPluginConfig());
-    const page = createExternalPluginPage(refresh, false);
+    const page = createExternalPluginPage(refresh);
     const context = (page as unknown as { context: ApplicationContext<RouteId> }).context;
     context.gateway.snapshot.client = {
       request: vi.fn(),
