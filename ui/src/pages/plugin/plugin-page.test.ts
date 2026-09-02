@@ -8,6 +8,7 @@ import { waitForFast } from "../../test-helpers/wait-for.ts";
 import { getLogbookState, stopLogbookPolling } from "./logbook-controller.ts";
 import { renderLogbook } from "./logbook-view.ts";
 import { PluginPage } from "./plugin-page.ts";
+import { PluginUiDocumentController } from "./plugin-ui-document.ts";
 
 type TestBundledView = {
   render: (props: Parameters<typeof renderLogbook>[0]) => unknown;
@@ -31,6 +32,19 @@ function deferred<T>() {
     resolve = resolvePromise;
   });
   return { promise, resolve };
+}
+
+function mockPluginUiDocuments() {
+  return vi.spyOn(globalThis, "fetch").mockImplementation(
+    async () =>
+      new Response("<!doctype html><main>Plugin panel</main>", {
+        headers: { "Content-Type": "text/html; charset=utf-8" },
+      }),
+  );
+}
+
+function pluginUiBridgeNonce(frame: HTMLIFrameElement | null): string | undefined {
+  return frame?.srcdoc.match(/data-openclaw-plugin-ui-nonce="([^"]+)"/u)?.[1];
 }
 
 class DeferredPluginPage extends PluginPage {
@@ -414,7 +428,195 @@ describe("PluginPage", () => {
     }
   });
 
+  it("remounts an external frame when its document identity changes", async () => {
+    const fetchPluginDocument = mockPluginUiDocuments();
+    const refresh = vi.fn(async () => externalPluginConfig());
+    const page = createExternalPluginPage(refresh, false);
+    const context = (page as unknown as { context: ApplicationContext<RouteId> }).context;
+    const tab = context.gateway.snapshot.hello?.controlUiTabs?.[0];
+    if (!tab) {
+      throw new Error("expected external plugin tab");
+    }
+    tab.sessionActions = ["list-sessions"];
+    document.body.append(page);
+    try {
+      await waitForFast(() => expect(page.querySelector("iframe")).not.toBeNull());
+      const initialFrame = page.querySelector("iframe");
+      expect(initialFrame).not.toBeNull();
+      const initialWindow = initialFrame?.contentWindow;
+      const initialNonce = pluginUiBridgeNonce(initialFrame);
+      expect(initialNonce).toMatch(/^[0-9a-f-]{36}$/u);
+      expect(initialFrame?.getAttribute("src")).toBeNull();
+      expect(fetchPluginDocument).toHaveBeenCalledWith(
+        "/plugins/external/panel",
+        expect.objectContaining({ credentials: "include", redirect: "error" }),
+      );
+      expect(initialFrame?.srcdoc.indexOf("plugin-ui-bridge-child")).toBeLessThan(
+        initialFrame?.srcdoc.indexOf("Plugin panel") ?? 0,
+      );
+
+      tab.path = "/plugins/external/replacement";
+      page.requestUpdate();
+      await waitForFast(() => expect(page.querySelector("iframe")).not.toBe(initialFrame));
+      const pathFrame = page.querySelector("iframe");
+      expect(pathFrame).not.toBe(initialFrame);
+      expect(pathFrame?.contentWindow === initialWindow).toBe(false);
+      const pathNonce = pluginUiBridgeNonce(pathFrame);
+      expect(pathNonce).toMatch(/^[0-9a-f-]{36}$/u);
+      expect(pathNonce).not.toBe(initialNonce);
+      expect(pathFrame?.srcdoc).toContain(
+        `<base href="${new URL("/plugins/external/replacement", window.location.href).href}">`,
+      );
+      const pathWindow = pathFrame?.contentWindow;
+
+      context.config.current.embedSandboxMode = "trusted";
+      page.requestUpdate();
+      await waitForFast(() => expect(page.querySelector("iframe")).not.toBe(pathFrame));
+      const sandboxFrame = page.querySelector("iframe");
+      expect(sandboxFrame).not.toBe(pathFrame);
+      expect(sandboxFrame?.contentWindow === pathWindow).toBe(false);
+      expect(sandboxFrame?.getAttribute("sandbox")).toBe("allow-scripts allow-same-origin");
+      const sandboxNonce = pluginUiBridgeNonce(sandboxFrame);
+      expect(sandboxNonce).toMatch(/^[0-9a-f-]{36}$/u);
+      expect(sandboxNonce).not.toBe(pathNonce);
+    } finally {
+      page.remove();
+    }
+  });
+
+  it("does not mount an action bridge when the registered route redirects", async () => {
+    const fetchPluginDocument = vi
+      .spyOn(globalThis, "fetch")
+      .mockRejectedValue(new TypeError("redirect mode is set to error"));
+    const page = createExternalPluginPage(
+      vi.fn(async () => externalPluginConfig()),
+      false,
+    );
+    const context = (page as unknown as { context: ApplicationContext<RouteId> }).context;
+    const tab = context.gateway.snapshot.hello?.controlUiTabs?.[0];
+    if (!tab) {
+      throw new Error("expected external plugin tab");
+    }
+    tab.sessionActions = ["list-sessions"];
+
+    document.body.append(page);
+    try {
+      await waitForFast(() => expect(page.querySelector(".lazy-view-state")).not.toBeNull());
+      expect(fetchPluginDocument).toHaveBeenCalledWith(
+        "/plugins/external/panel",
+        expect.objectContaining({ redirect: "error" }),
+      );
+      expect(page.querySelector("iframe")).toBeNull();
+    } finally {
+      page.remove();
+    }
+  });
+
+  it("does not build an action document from downloadable HTML", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response("<!doctype html><main>Download only</main>", {
+        headers: {
+          "Content-Disposition": 'attachment; filename="panel.html"',
+          "Content-Type": "text/html",
+        },
+      }),
+    );
+    const requestUpdate = vi.fn();
+    const controller = new PluginUiDocumentController(requestUpdate);
+    controller.ensure("document-key", "/plugins/external/panel", "document-nonce", "allow-scripts");
+
+    await waitForFast(() => expect(requestUpdate).toHaveBeenCalledOnce());
+    expect(controller.current).toBeNull();
+    expect(controller.errorKey).toBe("document-key");
+  });
+
+  it("preserves a plugin base URL and route-origin CSP inside the bridge document", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response('<!doctype html><base href="../assets/"><script src="panel.js"></script>', {
+        headers: {
+          "Content-Security-Policy": "default-src 'self'; script-src 'self'",
+          "Content-Type": "text/html",
+        },
+      }),
+    );
+    const requestUpdate = vi.fn();
+    const controller = new PluginUiDocumentController(requestUpdate);
+    controller.ensure(
+      "document-key",
+      "/plugins/external/panel",
+      "document-nonce",
+      "allow-scripts allow-same-origin",
+    );
+
+    await waitForFast(() => expect(requestUpdate).toHaveBeenCalledOnce());
+    const parsed = new DOMParser().parseFromString(controller.current?.srcdoc ?? "", "text/html");
+    expect(parsed.querySelectorAll("base")).toHaveLength(1);
+    expect(parsed.querySelector("base")?.href).toBe(
+      new URL("/plugins/assets/", window.location.href).href,
+    );
+    expect(
+      parsed.querySelector('meta[http-equiv="Content-Security-Policy"]')?.getAttribute("content"),
+    ).toBe(`default-src ${window.location.origin}; script-src ${window.location.origin}`);
+  });
+
+  it("applies a response CSP sandbox to the outer action frame", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response("<!doctype html><main>Plugin panel</main>", {
+        headers: {
+          "Content-Security-Policy": "sandbox allow-scripts; default-src 'self'",
+          "Content-Type": "text/html",
+        },
+      }),
+    );
+    const requestUpdate = vi.fn();
+    const controller = new PluginUiDocumentController(requestUpdate);
+    controller.ensure(
+      "document-key",
+      "/plugins/external/panel",
+      "document-nonce",
+      "allow-scripts allow-same-origin",
+    );
+
+    await waitForFast(() => expect(requestUpdate).toHaveBeenCalledOnce());
+    expect(controller.current?.sandbox).toBe("allow-scripts");
+    const parsed = new DOMParser().parseFromString(controller.current?.srcdoc ?? "", "text/html");
+    expect(
+      parsed.querySelector('meta[http-equiv="Content-Security-Policy"]')?.getAttribute("content"),
+    ).toBe(`default-src ${window.location.origin}`);
+  });
+
+  it.each([
+    ["a CSP sandbox that disables scripts", "sandbox; default-src 'self'"],
+    [
+      "comma-combined response CSP policies",
+      "default-src 'self' 'unsafe-inline'; img-src *, script-src 'none'",
+    ],
+    ["a CSP embedding denial", "frame-ancestors 'none'; default-src 'self'"],
+  ])("does not build the action document for %s", async (_caseName, policy) => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response("<!doctype html><main>Plugin panel</main>", {
+        headers: {
+          "Content-Security-Policy": policy,
+          "Content-Type": "text/html",
+        },
+      }),
+    );
+    const requestUpdate = vi.fn();
+    const controller = new PluginUiDocumentController(requestUpdate);
+    controller.ensure(
+      "document-key",
+      "/plugins/external/panel",
+      "document-nonce",
+      "allow-scripts allow-same-origin",
+    );
+
+    await waitForFast(() => expect(requestUpdate).toHaveBeenCalledOnce());
+    expect(controller.current).toBeNull();
+    expect(controller.errorKey).toBe("document-key");
+  });
+
   it("exposes a connected gateway to external plugin session actions", async () => {
+    mockPluginUiDocuments();
     const refresh = vi.fn(async () => externalPluginConfig());
     const page = createExternalPluginPage(refresh, false);
     const context = (page as unknown as { context: ApplicationContext<RouteId> }).context;
@@ -428,7 +630,9 @@ describe("PluginPage", () => {
     tab.sessionActions = ["list-sessions"];
     const bridge = (
       page as unknown as {
-        pluginUiBridge: { sync: (target: { connected?: boolean } | null) => void };
+        pluginUiBridge: {
+          sync: (target: { connected?: boolean; nonce?: string } | null) => void;
+        };
       }
     ).pluginUiBridge;
     const sync = vi.spyOn(bridge, "sync");
@@ -438,6 +642,9 @@ describe("PluginPage", () => {
       await waitForFast(() =>
         expect(sync).toHaveBeenCalledWith(expect.objectContaining({ connected: true })),
       );
+      const target = sync.mock.calls.find(([value]) => value?.connected)?.[0];
+      expect(target?.nonce).toMatch(/^[0-9a-f-]{36}$/u);
+      expect(pluginUiBridgeNonce(page.querySelector("iframe"))).toBe(target?.nonce);
     } finally {
       page.remove();
     }

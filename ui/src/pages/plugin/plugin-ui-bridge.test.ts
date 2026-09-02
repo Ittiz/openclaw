@@ -3,6 +3,26 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { GatewayBrowserClient } from "../../api/gateway.ts";
 import { PluginUiBridgeController } from "./plugin-ui-bridge.ts";
 
+function offerBridgePort(frame: HTMLIFrameElement, nonce: string) {
+  const frameWindow = frame.contentWindow;
+  if (!frameWindow) {
+    throw new Error("expected iframe window");
+  }
+  const channel = new MessageChannel();
+  const childPort = channel.port1;
+  const messages: unknown[] = [];
+  childPort.addEventListener("message", (event) => messages.push(event.data));
+  childPort.start();
+  window.dispatchEvent(
+    new MessageEvent("message", {
+      data: { v: 1, type: "openclaw.pluginUi.ready", nonce },
+      source: frameWindow,
+      ports: [channel.port2],
+    }),
+  );
+  return { childPort, messages };
+}
+
 async function connectBridge(
   params: {
     request?: ReturnType<typeof vi.fn>;
@@ -16,13 +36,13 @@ async function connectBridge(
   if (!frameWindow) {
     throw new Error("expected iframe window");
   }
-  const postMessage = vi.spyOn(frameWindow, "postMessage");
   const request = params.request ?? vi.fn(async () => ({ ok: true }));
   const navigateToChat = vi.fn();
   const bridge = new PluginUiBridgeController();
   bridge.sync({
     frame,
     key: "notes/settings",
+    nonce: "notes-nonce",
     pluginId: "notes",
     client: { request } as unknown as GatewayBrowserClient,
     connected: true,
@@ -32,35 +52,17 @@ async function connectBridge(
     allowChatNavigation: params.allowChatNavigation ?? false,
     navigateToChat,
   });
-  window.dispatchEvent(
-    new MessageEvent("message", {
-      data: { v: 1, type: "openclaw.pluginUi.ready" },
-      source: frameWindow,
-    }),
-  );
-  await vi.waitFor(() => expect(postMessage).toHaveBeenCalledOnce());
-  const [connectMessage, targetOrigin, ports] = postMessage.mock.calls[0] as unknown as [
-    Record<string, unknown>,
-    string,
-    MessagePort[],
-  ];
-  const childPort = ports[0];
-  if (!childPort) {
-    throw new Error("expected transferred bridge port");
-  }
-  const responses: unknown[] = [];
-  childPort.addEventListener("message", (event) => responses.push(event.data));
-  childPort.start();
+  const offered = offerBridgePort(frame, "notes-nonce");
+  await vi.waitFor(() => expect(offered.messages).toHaveLength(1));
+  const connectMessage = offered.messages.shift() as Record<string, unknown>;
   return {
     bridge,
-    childPort,
+    childPort: offered.childPort,
     connectMessage,
     frame,
     navigateToChat,
     request,
-    responses,
-    postMessage,
-    targetOrigin,
+    responses: offered.messages,
   };
 }
 
@@ -74,18 +76,18 @@ describe("PluginUiBridgeController", () => {
     const request = vi.fn(async () => ({ ok: true, result: { saved: true } }));
     const connected = await connectBridge({ request, sessionActions: ["save"] });
 
-    expect(connected.targetOrigin).toBe("*");
     expect(connected.connectMessage).toMatchObject({
       v: 1,
       type: "openclaw.pluginUi.connect",
       capabilities: { sessionActions: ["save"], navigateToChat: false },
-      context: { sessionKey: "agent:main:active", contextTokens: 64_000 },
+      context: { sessionKey: "agent:main:active", revision: 1, contextTokens: 64_000 },
     });
     connected.childPort.postMessage({
       v: 1,
       type: "openclaw.pluginUi.sessionAction",
       id: "save-1",
       actionId: "save",
+      contextRevision: 1,
       sessionKey: "agent:attacker:ignored",
       payload: { enabled: true },
     });
@@ -103,6 +105,7 @@ describe("PluginUiBridgeController", () => {
         type: "openclaw.pluginUi.response",
         id: "save-1",
         ok: true,
+        contextRevision: 1,
         result: { ok: true, result: { saved: true } },
       }),
     );
@@ -117,6 +120,7 @@ describe("PluginUiBridgeController", () => {
       type: "openclaw.pluginUi.sessionAction",
       id: "delete-1",
       actionId: "delete-everything",
+      contextRevision: 1,
     });
 
     await vi.waitFor(() => expect(connected.responses).toHaveLength(1));
@@ -137,6 +141,7 @@ describe("PluginUiBridgeController", () => {
       type: "openclaw.pluginUi.navigate",
       id: "navigate-1",
       target: "chat",
+      contextRevision: 1,
       sessionKey: "agent:main:resumed",
     });
 
@@ -148,85 +153,101 @@ describe("PluginUiBridgeController", () => {
       type: "openclaw.pluginUi.response",
       id: "navigate-1",
       ok: true,
+      contextRevision: 1,
     });
     connected.bridge.clear();
     connected.childPort.close();
   });
 
-  it("coalesces adjacent frame ready and load connection triggers", async () => {
+  it("requires the registered document nonce before the first connection", async () => {
     const frame = document.createElement("iframe");
     document.body.append(frame);
-    const frameWindow = frame.contentWindow;
-    if (!frameWindow) {
-      throw new Error("expected iframe window");
-    }
-    const postMessage = vi.spyOn(frameWindow, "postMessage");
+    const postMessage = vi.spyOn(frame.contentWindow!, "postMessage");
+    const request = vi.fn();
     const bridge = new PluginUiBridgeController();
     bridge.sync({
       frame,
       key: "notes/settings",
+      nonce: "registered-document",
       pluginId: "notes",
-      client: { request: vi.fn() } as unknown as GatewayBrowserClient,
+      client: { request } as unknown as GatewayBrowserClient,
       connected: true,
       sessionKey: "agent:main:active",
       sessionActions: ["save"],
       allowChatNavigation: false,
       navigateToChat: vi.fn(),
     });
-    window.dispatchEvent(
-      new MessageEvent("message", {
-        data: { v: 1, type: "openclaw.pluginUi.ready" },
-        source: frameWindow,
-      }),
-    );
     frame.dispatchEvent(new Event("load"));
+    const redirected = offerBridgePort(frame, "off-route-document");
+    redirected.childPort.postMessage({
+      v: 1,
+      type: "openclaw.pluginUi.sessionAction",
+      id: "redirected-save",
+      actionId: "save",
+      contextRevision: 1,
+    });
 
-    await vi.waitFor(() => expect(postMessage).toHaveBeenCalledOnce());
     await new Promise<void>((resolve) => {
       setTimeout(resolve, 50);
     });
-    expect(postMessage).toHaveBeenCalledOnce();
+    expect(redirected.messages).toEqual([]);
+    expect(postMessage).not.toHaveBeenCalled();
+    expect(request).not.toHaveBeenCalled();
     bridge.clear();
+    redirected.childPort.close();
   });
 
-  it("ignores a repeated ready message after the bridge port is connected", async () => {
+  it("ignores a repeated port offer after the bridge is connected", async () => {
     const connected = await connectBridge();
-    window.dispatchEvent(
-      new MessageEvent("message", {
-        data: { v: 1, type: "openclaw.pluginUi.ready" },
-        source: connected.frame.contentWindow,
-      }),
-    );
+    const repeated = offerBridgePort(connected.frame, "notes-nonce");
 
     await new Promise<void>((resolve) => {
       setTimeout(resolve, 50);
     });
-    expect(connected.postMessage).toHaveBeenCalledOnce();
+    expect(repeated.messages).toEqual([]);
     connected.bridge.clear();
     connected.childPort.close();
+    repeated.childPort.close();
   });
 
-  it("keeps a ready-connected port across the iframe's late initial load", async () => {
+  it("revokes the bridge when the active iframe navigates", async () => {
     const connected = await connectBridge();
     connected.frame.dispatchEvent(new Event("load"));
 
+    connected.frame.dispatchEvent(new Event("load"));
+    connected.childPort.postMessage({
+      v: 1,
+      type: "openclaw.pluginUi.sessionAction",
+      id: "retired-save",
+      actionId: "save",
+      contextRevision: 1,
+    });
+    const navigation = offerBridgePort(connected.frame, "notes-nonce");
+    navigation.childPort.postMessage({
+      v: 1,
+      type: "openclaw.pluginUi.sessionAction",
+      id: "off-route-save",
+      actionId: "save",
+      contextRevision: 1,
+    });
     await new Promise<void>((resolve) => {
       setTimeout(resolve, 50);
     });
-    expect(connected.postMessage).toHaveBeenCalledOnce();
 
-    connected.frame.dispatchEvent(new Event("load"));
-    await vi.waitFor(() => expect(connected.postMessage).toHaveBeenCalledTimes(2));
+    expect(navigation.messages).toEqual([]);
+    expect(connected.request).not.toHaveBeenCalled();
     connected.bridge.clear();
     connected.childPort.close();
+    navigation.childPort.close();
   });
 
-  it("keeps the active port while refreshing its session context and client", async () => {
+  it("updates the active port and rejects requests from its prior session context", async () => {
     const connected = await connectBridge();
     const request = vi.fn(async () => ({ ok: true, result: { saved: true } }));
     connected.bridge.sync({
       frame: connected.frame,
       key: "notes/settings",
+      nonce: "notes-nonce",
       pluginId: "notes",
       client: { request } as unknown as GatewayBrowserClient,
       connected: true,
@@ -237,15 +258,42 @@ describe("PluginUiBridgeController", () => {
       navigateToChat: vi.fn(),
     });
 
-    await new Promise<void>((resolve) => {
-      setTimeout(resolve, 50);
+    await vi.waitFor(() =>
+      expect(connected.responses).toContainEqual({
+        v: 1,
+        type: "openclaw.pluginUi.update",
+        capabilities: { sessionActions: ["save"], navigateToChat: false },
+        context: {
+          sessionKey: "agent:main:refreshed",
+          revision: 2,
+          contextTokens: 128_000,
+        },
+      }),
+    );
+    connected.childPort.postMessage({
+      v: 1,
+      type: "openclaw.pluginUi.sessionAction",
+      id: "save-stale",
+      actionId: "save",
+      contextRevision: 1,
     });
-    expect(connected.postMessage).toHaveBeenCalledOnce();
+    await vi.waitFor(() =>
+      expect(connected.responses).toContainEqual(
+        expect.objectContaining({
+          id: "save-stale",
+          ok: false,
+          error: "Plugin UI session context is stale",
+        }),
+      ),
+    );
+    expect(request).not.toHaveBeenCalled();
+
     connected.childPort.postMessage({
       v: 1,
       type: "openclaw.pluginUi.sessionAction",
       id: "save-refreshed",
       actionId: "save",
+      contextRevision: 2,
       payload: { enabled: true },
     });
     await vi.waitFor(() =>
@@ -266,6 +314,7 @@ describe("PluginUiBridgeController", () => {
     connected.bridge.sync({
       frame: connected.frame,
       key: "calendar/settings",
+      nonce: "calendar-nonce",
       pluginId: "calendar",
       client: { request: replacementRequest } as unknown as GatewayBrowserClient,
       connected: true,
@@ -280,37 +329,31 @@ describe("PluginUiBridgeController", () => {
       type: "openclaw.pluginUi.sessionAction",
       id: "retired-save",
       actionId: "save",
+      contextRevision: 1,
     });
-    window.dispatchEvent(
-      new MessageEvent("message", {
-        data: { v: 1, type: "openclaw.pluginUi.ready" },
-        source: connected.frame.contentWindow,
-      }),
-    );
+    const earlyReplacement = offerBridgePort(connected.frame, "calendar-nonce");
 
     await new Promise<void>((resolve) => {
       setTimeout(resolve, 50);
     });
     expect(replacementRequest).not.toHaveBeenCalled();
-    expect(connected.postMessage).toHaveBeenCalledOnce();
+    expect(earlyReplacement.messages).toEqual([]);
 
     connected.frame.dispatchEvent(new Event("load"));
-    await vi.waitFor(() => expect(connected.postMessage).toHaveBeenCalledTimes(2));
-    const replacementConnect = connected.postMessage.mock.calls[1] as unknown as [
-      Record<string, unknown>,
-      string,
-      MessagePort[],
-    ];
-    const ports = replacementConnect[2];
-    const replacementPort = ports[0];
-    if (!replacementPort) {
-      throw new Error("expected replacement bridge port");
-    }
-    replacementPort.postMessage({
+    const replacement = offerBridgePort(connected.frame, "calendar-nonce");
+    await vi.waitFor(() => expect(replacement.messages).toHaveLength(1));
+    expect(replacement.messages[0]).toMatchObject({
+      v: 1,
+      type: "openclaw.pluginUi.connect",
+      capabilities: { sessionActions: ["save"], navigateToChat: false },
+      context: { sessionKey: "agent:main:replacement", revision: 1 },
+    });
+    replacement.childPort.postMessage({
       v: 1,
       type: "openclaw.pluginUi.sessionAction",
       id: "replacement-save",
       actionId: "save",
+      contextRevision: 1,
     });
     await vi.waitFor(() =>
       expect(replacementRequest).toHaveBeenCalledWith("plugins.sessionAction", {
@@ -321,6 +364,7 @@ describe("PluginUiBridgeController", () => {
     );
     connected.bridge.clear();
     connected.childPort.close();
-    replacementPort.close();
+    earlyReplacement.childPort.close();
+    replacement.childPort.close();
   });
 });

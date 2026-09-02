@@ -513,71 +513,55 @@ api.session.controls.registerControlUiDescriptor({
 });
 ```
 
-The frame announces readiness with
-`window.parent.postMessage({ v: 1, type: "openclaw.pluginUi.ready" }, "*")`.
-Because a very fast frame can finish loading before the parent attaches its
-listener, repeat the ready message briefly until the connection arrives.
-The parent then connects by transferring a
-`MessagePort` in an `openclaw.pluginUi.connect` message. The message includes
-the declared capabilities plus the active `sessionKey` and, when known,
-`contextTokens`. Receive and start that port before invoking an action:
+For a tab with bridge capabilities, the parent fetches the registered local
+route without following redirects, preserves its base URL and response CSP,
+and mounts the result as an opaque `srcdoc`. OpenClaw inserts a core-owned
+bridge script before plugin code. That first script offers a private
+`MessagePort`; later documents cannot replace it or re-arm the frame. Therefore,
+an action-capable route must return its final HTML directly rather than a 3xx
+redirect.
+
+The script exposes `window.openclawPluginUiBridge.connected`. It resolves with
+the private port and the `openclaw.pluginUi.connect` message, including the
+declared capabilities plus the active `sessionKey` and, when known,
+`contextTokens`. Wait for it before invoking an action:
 
 ```javascript
-const announceReady = () => {
-  window.parent.postMessage({ v: 1, type: "openclaw.pluginUi.ready" }, "*");
-};
-
-let readyTimer;
-const connectedPort = new Promise((resolve) => {
-  const handleConnect = (event) => {
-    if (
-      event.source !== window.parent ||
-      event.data?.v !== 1 ||
-      event.data.type !== "openclaw.pluginUi.connect"
-    ) {
-      return;
-    }
-    const port = event.ports[0];
-    if (!port) {
-      return;
-    }
-    window.removeEventListener("message", handleConnect);
-    window.clearInterval(readyTimer);
-    port.addEventListener("message", (event) => {
-      if (event.data?.v === 1 && event.data.type === "openclaw.pluginUi.response") {
-        console.log("Plugin UI response", event.data);
-      }
-    });
-    port.start();
-    resolve(port);
-  };
-
-  window.addEventListener("message", handleConnect);
+const connected = await window.openclawPluginUiBridge.connected;
+const { port } = connected;
+let connection = connected.connection;
+console.log("Plugin UI capabilities", connection.capabilities);
+port.addEventListener("message", (event) => {
+  if (event.data?.v === 1 && event.data.type === "openclaw.pluginUi.update") {
+    connection = event.data;
+  }
+  if (event.data?.v === 1 && event.data.type === "openclaw.pluginUi.response") {
+    console.log("Plugin UI response", event.data);
+  }
 });
-
-announceReady();
-readyTimer = window.setInterval(announceReady, 250);
-window.setTimeout(() => window.clearInterval(readyTimer), 5_000);
 ```
 
 Invoke an allowed action after the connection arrives:
 
 ```javascript
-void connectedPort.then((port) => {
-  port.postMessage({
-    v: 1,
-    type: "openclaw.pluginUi.sessionAction",
-    id: "append-1",
-    actionId: "append-entry",
-    payload: { text: "Ship the narrow bridge" },
-  });
+port.postMessage({
+  v: 1,
+  type: "openclaw.pluginUi.sessionAction",
+  id: "append-1",
+  actionId: "append-entry",
+  contextRevision: connection.context.revision,
+  payload: { text: "Ship the narrow bridge" },
 });
 ```
 
 The parent replies on the same port with
 `{ v: 1, type: "openclaw.pluginUi.response", id, ok, result?, error? }`.
+It sends `openclaw.pluginUi.update` when the active session context or declared
+capabilities change. Each action and navigation request must echo the latest
+`context.revision` as `contextRevision`; stale requests are rejected before
+Gateway dispatch.
 When chat navigation is enabled, the frame can send
-`{ v: 1, type: "openclaw.pluginUi.navigate", id, target: "chat", sessionKey }`.
+`{ v: 1, type: "openclaw.pluginUi.navigate", id, target: "chat", sessionKey, contextRevision }`.
 The parent accepts neither a plugin id nor a target session key for action
 dispatch: the active descriptor and current Control UI session supply both.
 

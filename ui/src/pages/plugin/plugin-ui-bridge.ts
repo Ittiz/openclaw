@@ -4,6 +4,7 @@ import type { GatewayBrowserClient } from "../../api/gateway.ts";
 type PluginUiBridgeTarget = {
   frame: HTMLIFrameElement;
   key: string;
+  nonce: string;
   pluginId: string;
   client: GatewayBrowserClient | null;
   connected: boolean;
@@ -22,7 +23,13 @@ type PluginUiBridgeMessage = {
   payload?: unknown;
   target?: unknown;
   sessionKey?: unknown;
+  contextRevision?: unknown;
+  nonce?: unknown;
 };
+
+function sameStrings(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
+}
 
 function normalizeMessageId(value: unknown): string {
   return typeof value === "string" && value.length > 0 && value.length <= 256 ? value : "";
@@ -50,8 +57,8 @@ export class PluginUiBridgeController {
   private port: MessagePort | null = null;
   private loadHandler: (() => void) | null = null;
   private readyHandler: ((event: MessageEvent) => void) | null = null;
-  private connectTimer: ReturnType<typeof setTimeout> | null = null;
-  private loadState: "initial" | "active" | "replacement" = "initial";
+  private loadState: "initial" | "active" | "replacement" | "revoked" = "initial";
+  private contextRevision = 0;
 
   sync(target: PluginUiBridgeTarget | null) {
     if (!target) {
@@ -59,7 +66,16 @@ export class PluginUiBridgeController {
       return;
     }
     const currentTarget = this.target;
-    if (currentTarget?.frame === target.frame && currentTarget.key === target.key) {
+    if (
+      currentTarget?.frame === target.frame &&
+      currentTarget.key === target.key &&
+      currentTarget.nonce === target.nonce
+    ) {
+      const sessionChanged = currentTarget.sessionKey !== target.sessionKey;
+      const contextChanged = sessionChanged || currentTarget.contextTokens !== target.contextTokens;
+      const capabilitiesChanged =
+        !sameStrings(currentTarget.sessionActions, target.sessionActions) ||
+        currentTarget.allowChatNavigation !== target.allowChatNavigation;
       // Keep object identity stable for the active port listener while
       // refreshing callback/client references from the latest UI context.
       // UI snapshots can also refine session context after the first action
@@ -67,6 +83,12 @@ export class PluginUiBridgeController {
       // Handlers read this mutable target, so the established port immediately
       // uses the latest connection, scopes, session, and context window.
       Object.assign(currentTarget, target);
+      if (this.port && (contextChanged || capabilitiesChanged)) {
+        if (sessionChanged) {
+          this.contextRevision += 1;
+        }
+        this.postConnectionState(currentTarget, this.port, "openclaw.pluginUi.update");
+      }
       return;
     }
 
@@ -79,68 +101,49 @@ export class PluginUiBridgeController {
         // Lit reuses the iframe element across plugin routes. Do not let the
         // retiring document reacquire a port carrying the next tab's grant.
         this.loadState = "active";
-        this.scheduleConnect();
         return;
       }
       if (this.loadState === "initial") {
         this.loadState = "active";
-        // A child can announce readiness before its initial iframe load event
-        // reaches the parent. Keep the port established by that ready message;
-        // only later loads represent a replacement document.
-        if (!this.port) {
-          this.scheduleConnect();
-        }
         return;
       }
-      // A load means the frame has a new document and can no longer use the
-      // previously transferred port. Invalidate it before reconnecting.
+      if (this.loadState === "revoked") {
+        return;
+      }
+      // A later same-tab load is an uncontrolled document replacement. The
+      // WindowProxy survives navigation and opaque sandbox origins cannot
+      // identify the new document, so revoke this frame until the parent
+      // intentionally selects a new tab key.
       this.port?.close();
       this.port = null;
-      this.scheduleConnect();
+      this.loadState = "revoked";
     };
     target.frame.addEventListener("load", this.loadHandler);
     this.readyHandler = (event: MessageEvent) => {
       const data = parsePluginUiBridgeMessage(event.data);
-      if (
-        this.loadState !== "replacement" &&
-        this.target?.frame === target.frame &&
-        event.source === target.frame.contentWindow &&
-        data?.v === 1 &&
-        data.type === "openclaw.pluginUi.ready"
-      ) {
-        // Plugins may repeat `ready` until the first connection arrives. A
-        // queued repeat can land just after the port transfer; do not replace
-        // that healthy port merely because the readiness retry was in flight.
-        if (!this.port) {
-          this.scheduleConnect();
-        }
+      if (data?.v !== 1 || data.type !== "openclaw.pluginUi.ready") {
+        return;
       }
+      const offeredPort = event.ports[0];
+      if (
+        this.loadState === "replacement" ||
+        this.loadState === "revoked" ||
+        this.target?.frame !== target.frame ||
+        event.source !== target.frame.contentWindow ||
+        data.nonce !== target.nonce ||
+        !offeredPort ||
+        this.port
+      ) {
+        offeredPort?.close();
+        return;
+      }
+      this.connect(target, offeredPort);
     };
     window.addEventListener("message", this.readyHandler);
   }
 
-  private scheduleConnect() {
-    if (this.connectTimer) {
-      clearTimeout(this.connectTimer);
-    }
-    // A sandboxed frame commonly emits its ready message immediately before
-    // the iframe load event. Coalesce both triggers so an action sent on the
-    // first transferred port cannot be orphaned by an immediate replacement.
-    this.connectTimer = setTimeout(() => {
-      this.connectTimer = null;
-      this.connect();
-    }, 20);
-  }
-
-  private connect() {
-    const target = this.target;
-    const frameWindow = target?.frame.contentWindow;
-    if (!target || !frameWindow) {
-      return;
-    }
+  private connect(target: PluginUiBridgeTarget, port: MessagePort) {
     this.port?.close();
-    const channel = new MessageChannel();
-    const port = channel.port1;
     this.port = port;
     port.addEventListener("message", (event: MessageEvent) => {
       if (this.target !== target || this.port !== port) {
@@ -159,24 +162,31 @@ export class PluginUiBridgeController {
       }
     });
     port.start();
-    // Sandboxed plugin frames have an opaque origin, so source-window and
-    // transferred-port identity are the capability boundary rather than origin.
-    frameWindow.postMessage(
-      {
-        v: 1,
-        type: "openclaw.pluginUi.connect",
-        capabilities: {
-          sessionActions: [...target.sessionActions],
-          navigateToChat: target.allowChatNavigation,
-        },
-        context: {
-          sessionKey: target.sessionKey,
-          ...(target.contextTokens !== undefined ? { contextTokens: target.contextTokens } : {}),
-        },
+    this.contextRevision += 1;
+    // The registered document offers this nonce-bound private port. Sending
+    // capabilities on it binds them to that document even if its WindowProxy
+    // navigates before the parent receives the offer.
+    this.postConnectionState(target, port, "openclaw.pluginUi.connect");
+  }
+
+  private postConnectionState(
+    target: PluginUiBridgeTarget,
+    port: MessagePort,
+    type: "openclaw.pluginUi.connect" | "openclaw.pluginUi.update",
+  ) {
+    port.postMessage({
+      v: 1,
+      type,
+      capabilities: {
+        sessionActions: [...target.sessionActions],
+        navigateToChat: target.allowChatNavigation,
       },
-      "*",
-      [channel.port2],
-    );
+      context: {
+        sessionKey: target.sessionKey,
+        revision: this.contextRevision,
+        ...(target.contextTokens !== undefined ? { contextTokens: target.contextTokens } : {}),
+      },
+    });
   }
 
   private reply(
@@ -203,6 +213,14 @@ export class PluginUiBridgeController {
       this.reply(target, port, id, { ok: false, error: "Plugin UI action is not allowed" });
       return;
     }
+    if (message.contextRevision !== this.contextRevision) {
+      this.reply(target, port, id, {
+        ok: false,
+        error: "Plugin UI session context is stale",
+        contextRevision: message.contextRevision,
+      });
+      return;
+    }
     if (!target.connected || !target.client) {
       this.reply(target, port, id, { ok: false, error: "Gateway is disconnected" });
       return;
@@ -214,9 +232,17 @@ export class PluginUiBridgeController {
         sessionKey: target.sessionKey,
         ...(message.payload !== undefined ? { payload: message.payload } : {}),
       });
-      this.reply(target, port, id, { ok: true, result });
+      this.reply(target, port, id, {
+        ok: true,
+        result,
+        contextRevision: message.contextRevision,
+      });
     } catch (error) {
-      this.reply(target, port, id, { ok: false, error: errorMessage(error) });
+      this.reply(target, port, id, {
+        ok: false,
+        error: errorMessage(error),
+        contextRevision: message.contextRevision,
+      });
     }
   }
 
@@ -228,12 +254,20 @@ export class PluginUiBridgeController {
     const id = normalizeMessageId(message.id);
     const requestedSessionKey =
       typeof message.sessionKey === "string" ? message.sessionKey.trim() : "";
+    if (message.contextRevision !== this.contextRevision) {
+      this.reply(target, port, id, {
+        ok: false,
+        error: "Plugin UI session context is stale",
+        contextRevision: message.contextRevision,
+      });
+      return;
+    }
     if (!target.allowChatNavigation || message.target !== "chat") {
       this.reply(target, port, id, { ok: false, error: "Plugin UI navigation is not allowed" });
       return;
     }
     target.navigateToChat(requestedSessionKey || target.sessionKey);
-    this.reply(target, port, id, { ok: true });
+    this.reply(target, port, id, { ok: true, contextRevision: message.contextRevision });
   }
 
   clear() {
@@ -243,15 +277,12 @@ export class PluginUiBridgeController {
     if (this.readyHandler) {
       window.removeEventListener("message", this.readyHandler);
     }
-    if (this.connectTimer) {
-      clearTimeout(this.connectTimer);
-    }
     this.port?.close();
     this.target = null;
     this.port = null;
     this.loadHandler = null;
     this.readyHandler = null;
-    this.connectTimer = null;
     this.loadState = "initial";
+    this.contextRevision = 0;
   }
 }

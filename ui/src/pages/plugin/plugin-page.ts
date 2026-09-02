@@ -25,7 +25,8 @@ import { resolveEmbedSandbox } from "../../lib/chat/tool-display.ts";
 import { sessionNavigationTarget } from "../../lib/sessions/route-navigation.ts";
 import { OpenClawLightDomContentsElement } from "../../lit/openclaw-element.ts";
 import { SubscriptionsController } from "../../lit/subscriptions-controller.ts";
-import { PluginUiBridgeController } from "./plugin-ui-bridge.ts";
+import type { PluginUiBridgeController } from "./plugin-ui-bridge.ts";
+import { PluginUiFrameController } from "./plugin-ui-document.ts";
 import { pluginTabKey } from "./route.ts";
 
 /**
@@ -121,7 +122,8 @@ export class PluginPage extends OpenClawLightDomContentsElement {
   private externalAuthRefreshTimer: ReturnType<typeof setTimeout> | null = null;
   private externalAuthExpiryTimer: ReturnType<typeof setTimeout> | null = null;
   private externalAuthRefreshedAt = 0;
-  private readonly pluginUiBridge = new PluginUiBridgeController();
+  private readonly pluginUiFrame = new PluginUiFrameController(() => this.requestUpdate());
+  private readonly pluginUiBridge: PluginUiBridgeController = this.pluginUiFrame.bridge;
   private readonly subscriptions = new SubscriptionsController(this)
     .watch(
       () => this.context?.gateway,
@@ -155,7 +157,7 @@ export class PluginPage extends OpenClawLightDomContentsElement {
 
   override disconnectedCallback() {
     document.removeEventListener("visibilitychange", this.handleVisibilityChange);
-    this.pluginUiBridge.clear();
+    this.pluginUiFrame.clear();
     this.clearExternalTabAuth();
     this.subscriptions.clear();
     this.stopBundledView();
@@ -167,10 +169,16 @@ export class PluginPage extends OpenClawLightDomContentsElement {
     const info = this.tabInfo();
     const frame = this.querySelector<HTMLIFrameElement>(".plugin-tab-embed__frame");
     const sessionActions = info?.sessionActions ?? [];
+    if (!context || !info) {
+      this.pluginUiFrame.detach(true);
+      return;
+    }
+    if (!frame) {
+      this.pluginUiFrame.detach(false);
+      return;
+    }
     if (
-      !context ||
-      !info ||
-      !frame ||
+      !this.pluginUiFrame.bridgeNonce ||
       (sessionActions.length === 0 && info.allowChatNavigation !== true)
     ) {
       this.pluginUiBridge.sync(null);
@@ -185,6 +193,7 @@ export class PluginPage extends OpenClawLightDomContentsElement {
     this.pluginUiBridge.sync({
       frame,
       key: this.tabKey(),
+      nonce: this.pluginUiFrame.bridgeNonce,
       pluginId: info.pluginId,
       client: context.gateway.snapshot.client,
       connected: context.gateway.snapshot.phase === "connected",
@@ -684,14 +693,19 @@ export class PluginPage extends OpenClawLightDomContentsElement {
       if (info.requiresGatewayAuth === true && this.externalAuthReadyKey !== externalAuthKey) {
         return nothing;
       }
+      const sandbox = resolveEmbedSandbox(context.config.current.embedSandboxMode);
+      const bridgeEnabled =
+        (info.sessionActions?.length ?? 0) > 0 || info.allowChatNavigation === true;
       return html`
         <section class="plugin-tab-embed">
-          <iframe
-            class="plugin-tab-embed__frame"
-            src=${info.path}
-            title=${info.label}
-            sandbox=${resolveEmbedSandbox(context.config.current.embedSandboxMode)}
-          ></iframe>
+          ${this.pluginUiFrame.resolve({
+            pluginId: this.pluginId,
+            tabId: this.tabId,
+            path: info.path,
+            label: info.label,
+            sandbox,
+            bridgeEnabled,
+          })}
         </section>
       `;
     }
