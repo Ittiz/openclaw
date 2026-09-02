@@ -27,7 +27,6 @@ import {
   ensureInheritedManagedProxyRoutingActive,
   registerManagedProxyGatewayLoopbackBypass,
 } from "../infra/net/proxy/proxy-lifecycle.js";
-import { normalizeFingerprint } from "../infra/tls/fingerprint.js";
 import { logDebug, logError } from "../logger.js";
 import { redactToolPayloadText } from "../logging/redact.js";
 import { registerSecretValueForRedaction } from "../logging/secret-redaction-registry.js";
@@ -37,6 +36,7 @@ import { VERSION } from "../version.js";
 export {
   GatewayClientRequestError,
   isGatewayConnectAssemblyError,
+  isGatewayProtocolResponseError,
 } from "../../packages/gateway-client/src/index.js";
 export type {
   GatewayClientCloseInfo,
@@ -117,7 +117,6 @@ function createOpenClawGatewayClientHostDeps(
     ...preparedDeviceAuthDeps,
     beforeConnect: ensureInheritedManagedProxyRoutingActive,
     registerGatewayLoopbackBypass: registerManagedProxyGatewayLoopbackBypass,
-    normalizeTlsFingerprint: (fingerprint) => normalizeFingerprint(fingerprint ?? ""),
     logDebug,
     logError,
     redactForLog: redactToolPayloadText,
@@ -141,9 +140,8 @@ export class GatewayClient {
     const suppressOriginDeviceAuth = Boolean(
       deviceAuthScope && (baseOptions.token?.trim() || baseOptions.password?.trim()),
     );
-    if (baseOptions.cloudflareAccess) {
-      registerSecretValueForRedaction(baseOptions.cloudflareAccess.clientId);
-      registerSecretValueForRedaction(baseOptions.cloudflareAccess.clientSecret);
+    for (const value of Object.values(baseOptions.edgeAuthHeaders ?? {})) {
+      registerSecretValueForRedaction(value);
     }
     this.#client = new BaseGatewayClient({
       ...baseOptions,

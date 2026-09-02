@@ -1,3 +1,4 @@
+import type { RetiredAuthProfileCleanupPlan } from "../commands/doctor-auth-legacy-oauth.js";
 import type { probeGatewayMemoryStatus } from "../commands/doctor-gateway-health.js";
 import type { DoctorOptions, DoctorPrompter } from "../commands/doctor-prompter.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
@@ -19,10 +20,13 @@ type DoctorConfigResult = {
   sourceLastTouchedVersion?: string;
   skipPluginValidationOnWrite?: boolean;
   explicitSetPaths?: readonly (readonly string[])[];
+  persistCanonicalAgentRoster?: boolean;
   skipWizardMetadataForIncludeWrite?: boolean;
   preservedLegacyRootKeys?: readonly string[];
   shouldRepairCronCodexModelRefsAfterConfigWrite?: boolean;
   retiredPhoneControlStateCleanupPending?: boolean;
+  /** Store cleanup deferred until the repaired config reaches disk. */
+  retiredAuthProfileCleanupPlans?: readonly RetiredAuthProfileCleanupPlan[];
   blockedCodexModelIdentities?: readonly string[];
   /** Ephemeral doctor-only auth rename plan; never part of persisted config. */
   openAICodexAuthProfileIdMap?: ReadonlyMap<string, string>;
@@ -39,10 +43,8 @@ export type DoctorHealthFlowContext = {
   cfgForPersistence: OpenClawConfig;
   /** The finalized config-flow candidate crossed the atomic writer boundary. */
   configResultWriteCommitted?: boolean;
-  /** Cron ownership could not be made safe, so every config write remains deferred this run. */
-  configWriteDeferredByCronOwnership?: true;
-  /** The repaired candidate failed write validation; nothing was persisted this run. */
-  configWriteBlockedByValidation?: true;
+  /** The requested config write was refused; later repairs must not consume its candidate. */
+  configWriteRefusal?: "validation" | "cron-owner-safety";
   /** One-shot repairs that require a durable config write have completed. */
   postConfigWriteRepairsCommitted?: boolean;
   sourceConfigValid: boolean;
@@ -50,6 +52,8 @@ export type DoctorHealthFlowContext = {
   /** Whether the selected state directory already existed before doctor startup work. */
   stateDirExistedAtStart?: boolean;
   env?: NodeJS.ProcessEnv;
+  /** State migration owns service activation until final readiness passes. */
+  gatewayMaintenanceActive?: boolean;
   gatewayDetails?: ReturnType<typeof buildGatewayConnectionDetails>;
   healthOk?: boolean;
   gatewayHealthAuthenticated?: boolean;
