@@ -1,0 +1,33 @@
+{
+  "userAgent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/147.0.0.0 Safari/537.36",
+  "gatewayRequests": [
+    {
+      "method": "plugins.sessionAction",
+      "params": {
+        "pluginId": "proof",
+        "actionId": "save",
+        "sessionKey": "agent:proof:initial",
+        "payload": {
+          "proof": true
+        }
+      }
+    }
+  ],
+  "blockedIframeCount": 0,
+  "pluginAuthSrc": "/plugins/proof/direct",
+  "pluginAuthSrcdocLength": 0,
+  "iframeRows": [
+    "Allowed action: dispatched to parent-selected session",
+    "Unauthorized action: rejected before Gateway",
+    "Context update: revision 2 for agent:proof:updated",
+    "Stale revision: rejected before Gateway"
+  ],
+  "pluginAuthRequests": [
+    {
+      "method": "GET",
+      "resourceType": "document"
+    }
+  ],
+  "head": "f39850dd5976a59620330073711a850c45b4806c",
+  "consoleErrors": []
+}
