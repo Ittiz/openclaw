@@ -592,6 +592,7 @@ describe("PluginPage", () => {
       "default-src 'self' 'unsafe-inline'; img-src *, script-src 'none'",
     ],
     ["a CSP embedding denial", "frame-ancestors 'none'; default-src 'self'"],
+    ["a CSP route-base denial", "base-uri 'none'; default-src 'self'"],
   ])("does not build the action document for %s", async (_caseName, policy) => {
     vi.spyOn(globalThis, "fetch").mockResolvedValue(
       new Response("<!doctype html><main>Plugin panel</main>", {

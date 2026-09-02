@@ -84,7 +84,7 @@ export class PluginUiBridgeController {
       // uses the latest connection, scopes, session, and context window.
       Object.assign(currentTarget, target);
       if (this.port && (contextChanged || capabilitiesChanged)) {
-        if (sessionChanged) {
+        if (contextChanged) {
           this.contextRevision += 1;
         }
         this.postConnectionState(currentTarget, this.port, "openclaw.pluginUi.update");

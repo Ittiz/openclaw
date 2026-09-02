@@ -308,6 +308,55 @@ describe("PluginUiBridgeController", () => {
     connected.childPort.close();
   });
 
+  it("advances the context revision when the trusted context window changes", async () => {
+    const connected = await connectBridge();
+    connected.bridge.sync({
+      frame: connected.frame,
+      key: "notes/settings",
+      nonce: "notes-nonce",
+      pluginId: "notes",
+      client: { request: connected.request } as unknown as GatewayBrowserClient,
+      connected: true,
+      sessionKey: "agent:main:active",
+      contextTokens: 128_000,
+      sessionActions: ["save"],
+      allowChatNavigation: false,
+      navigateToChat: vi.fn(),
+    });
+
+    await vi.waitFor(() =>
+      expect(connected.responses).toContainEqual(
+        expect.objectContaining({
+          type: "openclaw.pluginUi.update",
+          context: {
+            sessionKey: "agent:main:active",
+            revision: 2,
+            contextTokens: 128_000,
+          },
+        }),
+      ),
+    );
+    connected.childPort.postMessage({
+      v: 1,
+      type: "openclaw.pluginUi.sessionAction",
+      id: "stale-context-window",
+      actionId: "save",
+      contextRevision: 1,
+    });
+    await vi.waitFor(() =>
+      expect(connected.responses).toContainEqual(
+        expect.objectContaining({
+          id: "stale-context-window",
+          ok: false,
+          error: "Plugin UI session context is stale",
+        }),
+      ),
+    );
+    expect(connected.request).not.toHaveBeenCalled();
+    connected.bridge.clear();
+    connected.childPort.close();
+  });
+
   it("retires the prior tab port before granting the replacement tab capabilities", async () => {
     const connected = await connectBridge({ sessionActions: ["save"] });
     const replacementRequest = vi.fn(async () => ({ ok: true }));

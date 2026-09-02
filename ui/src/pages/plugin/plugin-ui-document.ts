@@ -27,11 +27,24 @@ function validateResponsePolicy(policy: string, sourceOrigin: string): void {
     (directive) => directive.name === "frame-ancestors",
   );
   if (!frameAncestors) {
+    validateBasePolicy(policy, sourceOrigin);
     return;
   }
   const sources = frameAncestors.value.split(/\s+/u);
   if (!sources.some((source) => source === "*" || source === "'self'" || source === sourceOrigin)) {
     throw new Error("Plugin UI CSP does not allow the Control UI to embed it");
+  }
+  validateBasePolicy(policy, sourceOrigin);
+}
+
+function validateBasePolicy(policy: string, sourceOrigin: string): void {
+  const baseUri = policyDirectives(policy).find((directive) => directive.name === "base-uri");
+  if (!baseUri) {
+    return;
+  }
+  const sources = baseUri.value.split(/\s+/u);
+  if (!sources.some((source) => source === "*" || source === "'self'" || source === sourceOrigin)) {
+    throw new Error("Plugin UI CSP cannot preserve its route-relative base URL");
   }
 }
 
@@ -92,6 +105,7 @@ function buildPluginUiBridgeDocument(params: {
   for (const meta of parsed.querySelectorAll<HTMLMetaElement>(
     'meta[http-equiv="Content-Security-Policy" i]',
   )) {
+    validateBasePolicy(meta.content, routeUrl.origin);
     meta.content = adaptContentSecurityPolicy(meta.content, routeUrl.origin);
   }
   const responseCsp = params.contentSecurityPolicy ? parsed.createElement("meta") : null;
