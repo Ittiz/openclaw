@@ -557,6 +557,12 @@ describe("PluginPage", () => {
     expect(
       parsed.querySelector('meta[http-equiv="Content-Security-Policy"]')?.getAttribute("content"),
     ).toBe(`default-src ${window.location.origin}; script-src ${window.location.origin}`);
+    const headChildren = Array.from(parsed.head.children);
+    expect(
+      headChildren.indexOf(parsed.querySelector('meta[http-equiv="Content-Security-Policy"]')!),
+    ).toBeLessThan(
+      headChildren.indexOf(parsed.querySelector("script[data-openclaw-plugin-ui-nonce]")!),
+    );
   });
 
   it("applies a response CSP sandbox to the outer action frame", async () => {
@@ -593,6 +599,11 @@ describe("PluginPage", () => {
     ],
     ["a CSP embedding denial", "frame-ancestors 'none'; default-src 'self'"],
     ["a CSP route-base denial", "base-uri 'none'; default-src 'self'"],
+    ["a CSP script denial", "default-src 'self'; script-src 'none'"],
+    [
+      "a nonce-bound strict-dynamic script policy",
+      "script-src 'nonce-plugin' 'strict-dynamic' 'self'",
+    ],
   ])("does not build the action document for %s", async (_caseName, policy) => {
     vi.spyOn(globalThis, "fetch").mockResolvedValue(
       new Response("<!doctype html><main>Plugin panel</main>", {

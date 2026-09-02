@@ -17,12 +17,51 @@ function policyDirectives(policy: string): Array<{ name: string; value: string }
     });
 }
 
-function validateResponsePolicy(policy: string, sourceOrigin: string): void {
+function validateBridgeScriptPolicy(policy: string, sourceOrigin: string, bridgeUrl: string): void {
+  const directives = policyDirectives(policy);
+  const scriptPolicy =
+    directives.find((directive) => directive.name === "script-src-elem") ??
+    directives.find((directive) => directive.name === "script-src") ??
+    directives.find((directive) => directive.name === "default-src");
+  if (!scriptPolicy) {
+    return;
+  }
+  const sources = scriptPolicy.value.split(/\s+/u);
+  if (sources.includes("'strict-dynamic'")) {
+    throw new Error("Plugin UI CSP cannot authorize the core bridge script safely");
+  }
+  const bridge = new URL(bridgeUrl);
+  const allowed = sources.some((source) => {
+    if (source === "*" || source === "'self'" || source === sourceOrigin) {
+      return true;
+    }
+    if (/^[a-z][a-z0-9+.-]*:$/iu.test(source)) {
+      return source.toLowerCase() === bridge.protocol;
+    }
+    try {
+      const allowedUrl = new URL(source);
+      if (allowedUrl.origin !== bridge.origin) {
+        return false;
+      }
+      return allowedUrl.pathname.endsWith("/")
+        ? bridge.pathname.startsWith(allowedUrl.pathname)
+        : bridge.pathname === allowedUrl.pathname;
+    } catch {
+      return false;
+    }
+  });
+  if (!allowed) {
+    throw new Error("Plugin UI CSP blocks the core bridge script");
+  }
+}
+
+function validateResponsePolicy(policy: string, sourceOrigin: string, bridgeUrl: string): void {
   // The Fetch Headers API comma-combines repeated CSP fields. Re-emitting that
   // value as one meta policy would weaken their intersection, so fail closed.
   if (policy.includes(",")) {
     throw new Error("Plugin UI returned multiple or ambiguous CSP policies");
   }
+  validateBridgeScriptPolicy(policy, sourceOrigin, bridgeUrl);
   const frameAncestors = policyDirectives(policy).find(
     (directive) => directive.name === "frame-ancestors",
   );
@@ -89,8 +128,9 @@ function buildPluginUiBridgeDocument(params: {
   referrerPolicy?: string;
 }): { srcdoc: string; sandbox: string } {
   const routeUrl = new URL(params.path, window.location.href);
+  const bridgeUrl = new URL(pluginUiBridgeChildUrl, window.location.href).href;
   if (params.contentSecurityPolicy) {
-    validateResponsePolicy(params.contentSecurityPolicy, routeUrl.origin);
+    validateResponsePolicy(params.contentSecurityPolicy, routeUrl.origin, bridgeUrl);
   }
   const sandbox = tightenIframeSandbox(params.sandbox, params.contentSecurityPolicy);
   const parsed = new DOMParser().parseFromString(params.html, "text/html");
@@ -102,9 +142,11 @@ function buildPluginUiBridgeDocument(params: {
     fallbackBase!.href = routeUrl.href;
   }
 
-  for (const meta of parsed.querySelectorAll<HTMLMetaElement>(
-    'meta[http-equiv="Content-Security-Policy" i]',
-  )) {
+  const documentPolicies = Array.from(
+    parsed.querySelectorAll<HTMLMetaElement>('meta[http-equiv="Content-Security-Policy" i]'),
+  );
+  for (const meta of documentPolicies) {
+    validateBridgeScriptPolicy(meta.content, routeUrl.origin, bridgeUrl);
     validateBasePolicy(meta.content, routeUrl.origin);
     meta.content = adaptContentSecurityPolicy(meta.content, routeUrl.origin);
   }
@@ -122,11 +164,13 @@ function buildPluginUiBridgeDocument(params: {
     referrer.content = params.referrerPolicy!;
   }
   const bridge = parsed.createElement("script");
-  bridge.src = new URL(pluginUiBridgeChildUrl, window.location.href).href;
+  bridge.src = bridgeUrl;
   bridge.dataset.openclawPluginUiNonce = params.nonce;
   parsed.head.prepend(
+    ...[responseCsp].filter((node) => node !== null),
+    ...documentPolicies,
     bridge,
-    ...[responseCsp, referrer, fallbackBase].filter((node) => node !== null),
+    ...[referrer, fallbackBase].filter((node) => node !== null),
   );
 
   const doctype = params.html.match(/<!doctype[^>]*>/iu)?.[0] ?? "";
