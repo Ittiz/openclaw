@@ -133,7 +133,7 @@ function buildPluginUiBridgeDocument(params: {
   return { srcdoc: `${doctype}${parsed.documentElement.outerHTML}`, sandbox };
 }
 
-export class PluginUiDocumentController {
+class PluginUiDocumentController {
   current: { key: string; srcdoc: string; sandbox: string } | null = null;
   errorKey: string | null = null;
   private loadingKey = "";
@@ -213,7 +213,7 @@ export class PluginUiFrameController {
   readonly bridge = new PluginUiBridgeController();
   private identity = "";
   private nonce = "";
-  private readonly document = new PluginUiDocumentController(() => this.requestUpdate());
+  readonly document = new PluginUiDocumentController(() => this.requestUpdate());
 
   constructor(private readonly requestUpdate: () => void) {}
 

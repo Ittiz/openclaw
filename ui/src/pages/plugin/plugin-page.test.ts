@@ -8,7 +8,7 @@ import { waitForFast } from "../../test-helpers/wait-for.ts";
 import { getLogbookState, stopLogbookPolling } from "./logbook-controller.ts";
 import { renderLogbook } from "./logbook-view.ts";
 import { PluginPage } from "./plugin-page.ts";
-import { PluginUiDocumentController } from "./plugin-ui-document.ts";
+import { PluginUiFrameController } from "./plugin-ui-document.ts";
 
 type TestBundledView = {
   render: (props: Parameters<typeof renderLogbook>[0]) => unknown;
@@ -522,7 +522,7 @@ describe("PluginPage", () => {
       }),
     );
     const requestUpdate = vi.fn();
-    const controller = new PluginUiDocumentController(requestUpdate);
+    const controller = new PluginUiFrameController(requestUpdate).document;
     controller.ensure("document-key", "/plugins/external/panel", "document-nonce", "allow-scripts");
 
     await waitForFast(() => expect(requestUpdate).toHaveBeenCalledOnce());
@@ -540,7 +540,7 @@ describe("PluginPage", () => {
       }),
     );
     const requestUpdate = vi.fn();
-    const controller = new PluginUiDocumentController(requestUpdate);
+    const controller = new PluginUiFrameController(requestUpdate).document;
     controller.ensure(
       "document-key",
       "/plugins/external/panel",
@@ -569,7 +569,7 @@ describe("PluginPage", () => {
       }),
     );
     const requestUpdate = vi.fn();
-    const controller = new PluginUiDocumentController(requestUpdate);
+    const controller = new PluginUiFrameController(requestUpdate).document;
     controller.ensure(
       "document-key",
       "/plugins/external/panel",
@@ -603,7 +603,7 @@ describe("PluginPage", () => {
       }),
     );
     const requestUpdate = vi.fn();
-    const controller = new PluginUiDocumentController(requestUpdate);
+    const controller = new PluginUiFrameController(requestUpdate).document;
     controller.ensure(
       "document-key",
       "/plugins/external/panel",
