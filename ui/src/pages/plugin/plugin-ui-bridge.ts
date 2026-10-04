@@ -43,6 +43,42 @@ function parsePluginUiBridgeMessage(value: unknown): PluginUiBridgeMessage | nul
   return isRecord(value) ? value : null;
 }
 
+// MessagePort accepts structured-clone values that JSON would silently coerce
+// or discard. Reject those before the Gateway client's JSON serialization.
+function isJsonPayload(value: unknown, state = { nodes: 0 }, depth = 0): boolean {
+  state.nodes += 1;
+  if (state.nodes > 4096 || depth > 32) {
+    return false;
+  }
+  if (value === null || typeof value === "string" || typeof value === "boolean") {
+    return true;
+  }
+  if (typeof value === "number") {
+    return Number.isFinite(value);
+  }
+  if (Array.isArray(value)) {
+    // Iteration visits holes as undefined, unlike Array.prototype.every.
+    for (const entry of value) {
+      if (!isJsonPayload(entry, state, depth + 1)) {
+        return false;
+      }
+    }
+    return true;
+  }
+  if (!isRecord(value)) {
+    return false;
+  }
+  const prototype = Object.getPrototypeOf(value);
+  if (
+    prototype !== null &&
+    (Object.getPrototypeOf(prototype) !== null ||
+      Object.prototype.toString.call(value) !== "[object Object]")
+  ) {
+    return false;
+  }
+  return Object.values(value).every((entry) => isJsonPayload(entry, state, depth + 1));
+}
+
 /**
  * Gives one opaque plugin tab a narrow parent capability channel.
  *
@@ -223,6 +259,14 @@ export class PluginUiBridgeController {
     }
     if (!target.connected || !target.client) {
       this.reply(target, port, id, { ok: false, error: "Gateway is disconnected" });
+      return;
+    }
+    if (message.payload !== undefined && !isJsonPayload(message.payload)) {
+      this.reply(target, port, id, {
+        ok: false,
+        error: "Plugin UI action payload must be JSON-compatible",
+        contextRevision: message.contextRevision,
+      });
       return;
     }
     try {

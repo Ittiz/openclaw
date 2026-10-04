@@ -281,9 +281,11 @@ export class PluginUiFrameController {
     label: string;
     sandbox: string;
     bridgeEnabled: boolean;
+    onLoad: (event: Event) => void;
   }) {
     const identity = `${pluginTabKey({ pluginId: params.pluginId, id: params.tabId })}\0${params.path}\0${params.sandbox}\0${params.bridgeEnabled}`;
     if (this.identity !== identity) {
+      this.clear();
       this.identity = identity;
       this.nonce = params.bridgeEnabled ? generateUUID() : "";
     }
@@ -293,6 +295,7 @@ export class PluginUiFrameController {
         src=${params.path}
         title=${params.label}
         sandbox=${params.sandbox}
+        @load=${params.onLoad}
       ></iframe>`;
     }
 
@@ -316,6 +319,7 @@ export class PluginUiFrameController {
         srcdoc=${this.document.current.srcdoc}
         title=${params.label}
         sandbox=${this.document.current.sandbox}
+        @load=${params.onLoad}
       ></iframe>`,
     );
   }

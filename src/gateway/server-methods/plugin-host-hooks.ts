@@ -15,57 +15,27 @@ import {
 import { formatErrorMessage } from "../../infra/errors.js";
 import { createSubsystemLogger } from "../../logging/subsystem.js";
 import { isPluginJsonValue } from "../../plugins/host-hooks.js";
-import { getActivePluginSessionExtensionRegistry } from "../../plugins/runtime.js";
+import { getPluginRegistryVersion } from "../../plugins/runtime-state.js";
+import { getPluginRegistryForContext } from "../../plugins/runtime/gateway-request-scope.js";
+import { validateJsonSchemaValue, type JsonSchemaValue } from "../../plugins/schema-validator.js";
 import {
-  validateJsonSchemaValue,
-  type JsonSchemaValidationError,
-  type JsonSchemaValue,
-} from "../../plugins/schema-validator.js";
+  listControlUiPluginDescriptors,
+  listControlUiLinkReaders,
+  listControlUiPluginTabs,
+  listControlUiPluginWidgetKinds,
+} from "../control-ui-plugin-tabs.js";
 import { authorizeOperatorScopesForRequiredScope } from "../method-scopes.js";
 import { WRITE_SCOPE } from "../operator-scopes.js";
+import { readPreparedGatewayModelCatalogMetadata } from "../server-model-catalog-view.js";
 import { resolveRequestedSessionAgentId } from "../session-request-agent.js";
+import { withReadySessionRows, type SessionRowReadView } from "../session-row-prepared-read.js";
+import { requireSessionRowProjection } from "../session-row-projection-access.js";
 import { resolveStoredSessionKeyForAgentStore } from "../session-store-key.js";
-import {
-  buildGatewaySessionInfo,
-  resolveCanonicalSessionEntryFromStoreKeys,
-  resolveGatewaySessionStoreTargetWithStore,
-} from "../session-utils.js";
-import type { GatewayRequestContext, GatewayRequestHandlers } from "./types.js";
-import { assertValidParams } from "./validation.js";
+import { getSessionDefaults } from "../session-utils-model.js";
+import type { GatewayRequestHandlers } from "./types.js";
+import { defineValidatedGatewayHandler } from "./validation.js";
 
 const log = createSubsystemLogger("gateway/plugin-host-hooks");
-
-function formatSessionActionPayloadSchemaErrors(errors: JsonSchemaValidationError[]): string {
-  return errors.map((error) => error.text).join("; ");
-}
-
-function resolveSessionActionContextTokens(
-  context: GatewayRequestContext,
-  sessionKey: string | undefined,
-  agentId: string | undefined,
-): number | undefined {
-  if (!sessionKey) {
-    return undefined;
-  }
-  const cfg = context.getRuntimeConfig();
-  const target = resolveGatewaySessionStoreTargetWithStore({
-    cfg,
-    key: sessionKey,
-    ...(agentId ? { agentId } : {}),
-    clone: false,
-    readOnly: true,
-    exactRead: true,
-  });
-  const entry = resolveCanonicalSessionEntryFromStoreKeys(target.store, target.storeKeys);
-  return buildGatewaySessionInfo({
-    cfg,
-    storePath: target.storePath,
-    store: target.store,
-    key: target.canonicalKey,
-    entry,
-    agentId: target.agentId,
-  }).contextTokens;
-}
 
 /** Ensures plugin action result extension fields stay JSON-compatible on the wire. */
 function validatePluginSessionActionJsonFields(
@@ -81,251 +51,292 @@ function validatePluginSessionActionJsonFields(
 
 /** Gateway handlers for plugin-declared Control UI descriptors and session actions. */
 export const pluginHostHookHandlers: GatewayRequestHandlers = {
-  "plugins.uiDescriptors": ({ params, respond }) => {
-    if (
-      !assertValidParams(
-        params,
-        validatePluginsUiDescriptorsParams,
-        "plugins.uiDescriptors",
-        respond,
-      )
-    ) {
-      return;
-    }
-    const registry = getActivePluginSessionExtensionRegistry();
-    const descriptors = (registry?.controlUiDescriptors ?? []).map((entry) => {
-      const descriptor: Record<string, unknown> = {
-        id: entry.descriptor.id,
-        pluginId: entry.pluginId,
-        pluginName: entry.pluginName,
-        surface: entry.descriptor.surface,
-        label: entry.descriptor.label,
-      };
-      if (entry.descriptor.description !== undefined) {
-        descriptor.description = entry.descriptor.description;
-      }
-      if (entry.descriptor.placement !== undefined) {
-        descriptor.placement = entry.descriptor.placement;
-      }
-      if (entry.descriptor.schema !== undefined) {
-        descriptor.schema = entry.descriptor.schema;
-      }
-      if (entry.descriptor.requiredScopes !== undefined) {
-        descriptor.requiredScopes = entry.descriptor.requiredScopes;
-      }
-      return descriptor;
-    });
-    const result = { ok: true, descriptors };
-    if (!validatePluginsUiDescriptorsResult(result)) {
-      log.warn("invalid plugins.uiDescriptors result", {
-        errors: validatePluginsUiDescriptorsResult.errors,
-      });
-      respond(
-        false,
-        undefined,
-        errorShape(
-          ErrorCodes.UNAVAILABLE,
-          `invalid plugins.uiDescriptors result: ${formatValidationErrors(validatePluginsUiDescriptorsResult.errors)}`,
-        ),
-      );
-      return;
-    }
-    respond(true, result, undefined);
-  },
-  "plugins.sessionAction": async ({ params, client, respond, context }) => {
-    if (
-      !assertValidParams(
-        params,
-        validatePluginsSessionActionParams,
-        "plugins.sessionAction",
-        respond,
-      )
-    ) {
-      return;
-    }
-    const pluginId = normalizeOptionalString(params.pluginId);
-    const actionId = normalizeOptionalString(params.actionId);
-    const rawSessionKey = normalizeOptionalString(params.sessionKey);
-    const sessionOwner = rawSessionKey
-      ? resolveRequestedSessionAgentId(
-          context.getRuntimeConfig(),
-          rawSessionKey,
-          normalizeOptionalString(params.agentId),
-        )
-      : undefined;
-    if (sessionOwner && !sessionOwner.ok) {
-      respond(false, undefined, sessionOwner.error);
-      return;
-    }
-    const sessionKey =
-      rawSessionKey && sessionOwner?.ok
-        ? resolveStoredSessionKeyForAgentStore({
-            cfg: context.getRuntimeConfig(),
-            agentId: sessionOwner.agentId,
-            sessionKey: rawSessionKey,
-          })
-        : undefined;
-    if (!pluginId || !actionId) {
-      respond(
-        false,
-        undefined,
-        errorShape(
-          ErrorCodes.INVALID_REQUEST,
-          "plugins.sessionAction pluginId and actionId must be non-empty",
-        ),
-      );
-      return;
-    }
-    const registry = getActivePluginSessionExtensionRegistry();
-    const pluginLoaded = Boolean(
-      registry?.plugins.some((plugin) => plugin.id === pluginId && plugin.status === "loaded"),
-    );
-    const registration = (registry?.sessionActions ?? []).find(
-      (entry) => entry.pluginId === pluginId && entry.action.id === actionId,
-    );
-    if (!registration || !pluginLoaded) {
-      respond(
-        false,
-        undefined,
-        errorShape(
-          ErrorCodes.UNAVAILABLE,
-          `unknown plugin session action: ${pluginId}/${actionId}`,
-        ),
-      );
-      return;
-    }
-    const scopes = Array.isArray(client?.connect.scopes) ? client.connect.scopes : [];
-    const requiredScopes =
-      registration.action.requiredScopes && registration.action.requiredScopes.length > 0
-        ? registration.action.requiredScopes
-        : [WRITE_SCOPE];
-    // Recheck the selected registration after async router admission, using the same
-    // scope implications so the two authorization gates cannot diverge.
-    const missingScope = requiredScopes.find(
-      (scope) => !authorizeOperatorScopesForRequiredScope(scope, scopes).allowed,
-    );
-    if (missingScope) {
-      respond(false, undefined, missingScopeErrorShape({ missingScope, requiredScopes }));
-      return;
-    }
-    try {
-      if (params.payload !== undefined && !isPluginJsonValue(params.payload)) {
+  "plugins.uiDescriptors": defineValidatedGatewayHandler(
+    "plugins.uiDescriptors",
+    validatePluginsUiDescriptorsParams,
+    ({ respond, client, context }) => {
+      const methods = context.getGatewayMethodRegistry?.();
+      if (!methods) {
         respond(
           false,
           undefined,
           errorShape(
-            ErrorCodes.INVALID_REQUEST,
-            "plugin session action payload must be JSON-compatible",
+            ErrorCodes.UNAVAILABLE,
+            "Gateway plugin capabilities are unavailable in this runtime.",
           ),
         );
         return;
       }
-      if (registration.action.schema !== undefined) {
-        if (
-          typeof registration.action.schema !== "boolean" &&
-          !isRecord(registration.action.schema)
-        ) {
-          respond(
-            false,
-            undefined,
-            errorShape(
-              ErrorCodes.INVALID_REQUEST,
-              "plugin session action schema must be an object or boolean",
-            ),
-          );
-          return;
-        }
-        // Schemas are plugin-provided data; validate their shape before passing
-        // them into the shared schema evaluator so malformed plugins fail cleanly.
-        const validation = validateJsonSchemaValue({
-          schema: registration.action.schema as JsonSchemaValue,
-          cacheKey: `plugin-session-action:${pluginId}:${actionId}`,
-          value: params.payload,
-        });
-        if (!validation.ok) {
-          respond(
-            false,
-            undefined,
-            errorShape(
-              ErrorCodes.INVALID_REQUEST,
-              `plugin session action payload does not match schema: ${formatSessionActionPayloadSchemaErrors(validation.errors)}`,
-            ),
-          );
-          return;
-        }
-      }
-      const agentId = sessionOwner?.ok ? sessionOwner.agentId : undefined;
-      const contextTokens = resolveSessionActionContextTokens(context, sessionKey, agentId);
-      const result = await registration.action.handler({
-        pluginId,
-        actionId,
-        ...(sessionKey ? { sessionKey } : {}),
-        ...(agentId ? { agentId } : {}),
-        ...(contextTokens ? { contextTokens } : {}),
-        ...(params.payload !== undefined ? { payload: params.payload } : {}),
-        client: {
-          ...(client?.connId ? { connId: client.connId } : {}),
-          scopes: [...scopes],
-        },
-      });
-      if (result !== undefined && !isRecord(result)) {
-        respond(
-          false,
-          undefined,
-          errorShape(ErrorCodes.INVALID_REQUEST, "plugin session action result must be an object"),
-        );
-        return;
-      }
-      const wireResult = result?.ok === false ? result : { ok: true as const, ...result };
-      if (!validatePluginsSessionActionResult(wireResult)) {
-        respond(
-          false,
-          undefined,
-          errorShape(
-            ErrorCodes.INVALID_REQUEST,
-            `invalid plugin session action result: ${formatValidationErrors(validatePluginsSessionActionResult.errors)}`,
-          ),
-        );
-        return;
-      }
-      const jsonFieldError = result ? validatePluginSessionActionJsonFields(result) : undefined;
-      if (jsonFieldError) {
-        respond(false, undefined, errorShape(ErrorCodes.INVALID_REQUEST, jsonFieldError));
-        return;
-      }
-      if (!wireResult.ok) {
-        // Plugin-declared action failures are returned as a successful RPC
-        // with `ok: false` per PluginsSessionActionResultSchema. Reserve
-        // transport errorShape for protocol-level failures (validation,
-        // schema mismatch, dispatch error). Distinguishing these in the
-        // wire shape lets callers handle plugin failures (often retryable
-        // or user-facing) differently from transport errors (operator
-        // diagnostics).
-        respond(
-          true,
-          {
-            ok: false,
-            error: wireResult.error,
-            ...(wireResult.code !== undefined ? { code: wireResult.code } : {}),
-            ...(wireResult.details !== undefined ? { details: wireResult.details } : {}),
-          },
-          undefined,
-        );
-        return;
-      }
-      respond(true, {
+      const scopes = client?.connect.scopes ?? [];
+      const result = {
         ok: true,
-        ...(wireResult.result !== undefined ? { result: wireResult.result } : {}),
-        ...(wireResult.continueAgent !== undefined
-          ? { continueAgent: wireResult.continueAgent }
-          : {}),
-        ...(wireResult.reply !== undefined ? { reply: wireResult.reply } : {}),
-      });
-    } catch (error) {
-      log.warn(
-        `plugin session action failed plugin=${pluginId} action=${actionId}: ${formatErrorMessage(error)}`,
-      );
-      respond(false, undefined, errorShape(ErrorCodes.UNAVAILABLE, "plugin session action failed"));
-    }
-  },
+        generation: getPluginRegistryVersion(getPluginRegistryForContext()),
+        descriptors: listControlUiPluginDescriptors(scopes),
+        methods: methods.listAdvertisedMethods(),
+        controlUiTabs: listControlUiPluginTabs(scopes, {
+          requireGatewayAuthGrant: context.getRuntimeConfig().gateway?.auth?.mode !== "none",
+        }),
+        controlUiWidgetKinds: listControlUiPluginWidgetKinds(scopes),
+        controlUiLinkReaders: listControlUiLinkReaders(scopes, methods),
+        pluginSurfaceUrls: client?.pluginSurfaceUrls ?? {},
+      };
+      if (!validatePluginsUiDescriptorsResult(result)) {
+        log.warn("invalid plugins.uiDescriptors result", {
+          errors: validatePluginsUiDescriptorsResult.errors,
+        });
+        respond(
+          false,
+          undefined,
+          errorShape(
+            ErrorCodes.UNAVAILABLE,
+            `invalid plugins.uiDescriptors result: ${formatValidationErrors(validatePluginsUiDescriptorsResult.errors)}`,
+          ),
+        );
+        return;
+      }
+      respond(true, result, undefined);
+    },
+  ),
+  "plugins.sessionAction": defineValidatedGatewayHandler(
+    "plugins.sessionAction",
+    validatePluginsSessionActionParams,
+    async ({ params, client, respond, context }) => {
+      const pluginId = normalizeOptionalString(params.pluginId);
+      const actionId = normalizeOptionalString(params.actionId);
+      const rawSessionKey = normalizeOptionalString(params.sessionKey);
+      if (!pluginId || !actionId) {
+        respond(
+          false,
+          undefined,
+          errorShape(
+            ErrorCodes.INVALID_REQUEST,
+            "plugins.sessionAction pluginId and actionId must be non-empty",
+          ),
+        );
+        return;
+      }
+      try {
+        const projection = rawSessionKey ? requireSessionRowProjection(context) : undefined;
+        const dispatch = (read?: SessionRowReadView) => {
+          const cfg = read?.state.cfg ?? context.getRuntimeConfig();
+          const sessionOwner = rawSessionKey
+            ? resolveRequestedSessionAgentId(
+                cfg,
+                rawSessionKey,
+                normalizeOptionalString(params.agentId),
+              )
+            : undefined;
+          if (sessionOwner && !sessionOwner.ok) {
+            respond(false, undefined, sessionOwner.error);
+            return undefined;
+          }
+          const sessionKey =
+            rawSessionKey && sessionOwner?.ok
+              ? resolveStoredSessionKeyForAgentStore({
+                  cfg,
+                  agentId: sessionOwner.agentId,
+                  sessionKey: rawSessionKey,
+                })
+              : undefined;
+          const registry = getPluginRegistryForContext();
+          const pluginLoaded = Boolean(
+            registry?.plugins.some(
+              (plugin) => plugin.id === pluginId && plugin.status === "loaded",
+            ),
+          );
+          const registration = (registry?.sessionActions ?? []).find(
+            (entry) => entry.pluginId === pluginId && entry.action.id === actionId,
+          );
+          if (!registration || !pluginLoaded) {
+            respond(
+              false,
+              undefined,
+              errorShape(
+                ErrorCodes.UNAVAILABLE,
+                `unknown plugin session action: ${pluginId}/${actionId}`,
+              ),
+            );
+            return undefined;
+          }
+          const scopes = Array.isArray(client?.connect.scopes) ? client.connect.scopes : [];
+          const requiredScopes =
+            registration.action.requiredScopes && registration.action.requiredScopes.length > 0
+              ? registration.action.requiredScopes
+              : [WRITE_SCOPE];
+          // Recheck the selected registration after async router admission and session
+          // preparation, using the same scope implications as the router gate.
+          const missingScope = requiredScopes.find(
+            (scope) => !authorizeOperatorScopesForRequiredScope(scope, scopes).allowed,
+          );
+          if (missingScope) {
+            respond(false, undefined, missingScopeErrorShape({ missingScope, requiredScopes }));
+            return undefined;
+          }
+          if (params.payload !== undefined && !isPluginJsonValue(params.payload)) {
+            respond(
+              false,
+              undefined,
+              errorShape(
+                ErrorCodes.INVALID_REQUEST,
+                "plugin session action payload must be JSON-compatible",
+              ),
+            );
+            return undefined;
+          }
+          if (registration.action.schema !== undefined) {
+            if (
+              typeof registration.action.schema !== "boolean" &&
+              !isRecord(registration.action.schema)
+            ) {
+              respond(
+                false,
+                undefined,
+                errorShape(
+                  ErrorCodes.INVALID_REQUEST,
+                  "plugin session action schema must be an object or boolean",
+                ),
+              );
+              return undefined;
+            }
+            // Schemas are plugin-provided data; validate their shape before passing
+            // them into the shared schema evaluator so malformed plugins fail cleanly.
+            const validation = validateJsonSchemaValue({
+              schema: registration.action.schema as JsonSchemaValue,
+              cacheKey: `plugin-session-action:${pluginId}:${actionId}`,
+              value: params.payload,
+            });
+            if (!validation.ok) {
+              respond(
+                false,
+                undefined,
+                errorShape(
+                  ErrorCodes.INVALID_REQUEST,
+                  `plugin session action payload does not match schema: ${validation.errors.map((error) => error.text).join("; ")}`,
+                ),
+              );
+              return undefined;
+            }
+          }
+          let contextTokens: number | undefined;
+          if (read && sessionKey && sessionOwner?.ok) {
+            const row = read.describe({ key: sessionKey, agentId: sessionOwner.agentId });
+            if (row) {
+              contextTokens = row.materialized.row.contextTokens;
+            } else {
+              const modelCatalog = projection?.state.modelCatalog;
+              const preparedCatalog = Array.isArray(modelCatalog)
+                ? undefined
+                : modelCatalog?.get(sessionOwner.agentId);
+              contextTokens =
+                getSessionDefaults(
+                  cfg,
+                  Array.isArray(modelCatalog) ? modelCatalog : preparedCatalog?.entries,
+                  {
+                    agentId: sessionOwner.agentId,
+                    allowPluginNormalization: false,
+                    providerPolicySource: preparedCatalog?.pluginRegistry,
+                    metadataSnapshot: readPreparedGatewayModelCatalogMetadata(preparedCatalog),
+                  },
+                ).contextTokens ?? undefined;
+            }
+          }
+          // Start dispatch while prepared facts and authorization are current. The
+          // read consumer stays synchronous; only the returned handler result is awaited.
+          return {
+            result: registration.action.handler({
+              pluginId,
+              actionId,
+              ...(sessionKey ? { sessionKey } : {}),
+              ...(sessionOwner?.ok ? { agentId: sessionOwner.agentId } : {}),
+              ...(contextTokens !== undefined ? { contextTokens } : {}),
+              ...(params.payload !== undefined ? { payload: params.payload } : {}),
+              client: {
+                ...(client?.connId ? { connId: client.connId } : {}),
+                scopes: [...scopes],
+              },
+            }),
+          };
+        };
+        const dispatched =
+          projection && rawSessionKey
+            ? await withReadySessionRows(
+                projection,
+                (cfg) => {
+                  const owner = resolveRequestedSessionAgentId(
+                    cfg,
+                    rawSessionKey,
+                    normalizeOptionalString(params.agentId),
+                  );
+                  return owner.ok ? [{ key: rawSessionKey, agentId: owner.agentId }] : [];
+                },
+                dispatch,
+              )
+            : dispatch();
+        if (!dispatched) {
+          return;
+        }
+        const result = await dispatched.result;
+        if (result !== undefined && !isRecord(result)) {
+          respond(
+            false,
+            undefined,
+            errorShape(
+              ErrorCodes.INVALID_REQUEST,
+              "plugin session action result must be an object",
+            ),
+          );
+          return;
+        }
+        const wireResult = result?.ok === false ? result : { ok: true as const, ...result };
+        if (!validatePluginsSessionActionResult(wireResult)) {
+          respond(
+            false,
+            undefined,
+            errorShape(
+              ErrorCodes.INVALID_REQUEST,
+              `invalid plugin session action result: ${formatValidationErrors(validatePluginsSessionActionResult.errors)}`,
+            ),
+          );
+          return;
+        }
+        const jsonFieldError = result ? validatePluginSessionActionJsonFields(result) : undefined;
+        if (jsonFieldError) {
+          respond(false, undefined, errorShape(ErrorCodes.INVALID_REQUEST, jsonFieldError));
+          return;
+        }
+        if (!wireResult.ok) {
+          // Plugin failures are successful RPCs with ok:false; transport errors
+          // are reserved for invalid protocol data or failed dispatch.
+          respond(
+            true,
+            {
+              ok: false,
+              error: wireResult.error,
+              ...(wireResult.code !== undefined ? { code: wireResult.code } : {}),
+              ...(wireResult.details !== undefined ? { details: wireResult.details } : {}),
+            },
+            undefined,
+          );
+          return;
+        }
+        respond(true, {
+          ok: true,
+          ...(wireResult.result !== undefined ? { result: wireResult.result } : {}),
+          ...(wireResult.continueAgent !== undefined
+            ? { continueAgent: wireResult.continueAgent }
+            : {}),
+          ...(wireResult.reply !== undefined ? { reply: wireResult.reply } : {}),
+        });
+      } catch (error) {
+        log.warn(
+          `plugin session action failed plugin=${pluginId} action=${actionId}: ${formatErrorMessage(error)}`,
+        );
+        respond(
+          false,
+          undefined,
+          errorShape(ErrorCodes.UNAVAILABLE, "plugin session action failed"),
+        );
+      }
+    },
+  ),
 };

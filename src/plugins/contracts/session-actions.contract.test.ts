@@ -6,6 +6,7 @@ import {
   registerTestPlugin,
 } from "openclaw/plugin-sdk/plugin-test-contracts";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import {
   ADMIN_SCOPE,
   APPROVALS_SCOPE,
@@ -20,10 +21,15 @@ import {
 import { handleGatewayRequest } from "../../gateway/server-methods.js";
 import { pluginHostHookHandlers } from "../../gateway/server-methods/plugin-host-hooks.js";
 import type { GatewayClient, RespondFn } from "../../gateway/server-methods/types.js";
-import { onAgentEvent, resetAgentEventsForTest } from "../../infra/agent-events.js";
+import {
+  withPreparedSessionRows,
+  type SessionRowReadView,
+} from "../../gateway/session-row-prepared-read.js";
+import { bindSessionRowProjection } from "../../gateway/session-row-projection-access.js";
+import type { SessionRowProjection } from "../../gateway/session-row-projection.js";
+import { createDeferredCore } from "../../shared/deferred.js";
 import type { PluginSessionActionContext } from "../host-hooks.js";
 import { createEmptyPluginRegistry } from "../registry-empty.js";
-import { createPluginRegistry } from "../registry.js";
 import { setActivePluginRegistry } from "../runtime.js";
 import { createPluginRecord } from "../status.test-fixtures.js";
 import type { OpenClawPluginApi } from "../types.js";
@@ -31,6 +37,67 @@ import type { OpenClawPluginApi } from "../types.js";
 const MAIN_SESSION_KEY = "agent:main:main";
 
 type HookResponse = { ok: boolean; payload?: unknown; error?: unknown };
+
+function createSessionActionContextForTest(
+  options: {
+    projectedContextTokens?: number;
+    modelCatalog?: SessionRowProjection["state"]["modelCatalog"];
+    beforeRead?: () => Promise<void>;
+  } = {},
+) {
+  const cfg: OpenClawConfig = {
+    agents: { defaults: { model: { primary: "openai/pr-bridge-test" } } },
+    models: {
+      providers: {
+        openai: {
+          baseUrl: "https://example.invalid/v1",
+          models: [
+            {
+              id: "pr-bridge-test",
+              name: "PR Bridge Test",
+              reasoning: false,
+              input: ["text"],
+              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+              contextTokens: 64_000,
+              maxTokens: 4_096,
+            },
+          ],
+        },
+      },
+    },
+  };
+  const read = {
+    state: { cfg, policyConfig: cfg, rowContext: {} },
+    describe: () =>
+      options.projectedContextTokens === undefined
+        ? undefined
+        : { materialized: { row: { contextTokens: options.projectedContextTokens } } },
+  } as unknown as SessionRowReadView;
+  const withPreparedExactRows: SessionRowProjection["withPreparedExactRows"] = async (
+    queries,
+    consume,
+  ) => {
+    await options.beforeRead?.();
+    return withPreparedSessionRows(
+      { ...read, isCurrent: () => true, getPolicyConfig: () => cfg },
+      () => true,
+      queries,
+      consume,
+    );
+  };
+  const projection = {
+    state: { modelCatalog: options.modelCatalog ?? [] },
+    withPreparedExactRows,
+    sharingTargetState: () => ({ status: "missing" }),
+  } as unknown as SessionRowProjection;
+  return bindSessionRowProjection(
+    {
+      getRuntimeConfig: () => cfg,
+      logGateway: { warn() {} },
+    },
+    () => projection,
+  );
+}
 
 function sessionActionBody(
   pluginId: string,
@@ -47,6 +114,7 @@ function sessionActionBody(
 async function callPluginSessionActionForTest(params: {
   body: Record<string, unknown>;
   scopes?: string[];
+  context?: ReturnType<typeof createSessionActionContextForTest>;
 }): Promise<HookResponse> {
   let response: HookResponse | undefined;
   const respond: RespondFn = (ok, payload, error) => {
@@ -64,16 +132,7 @@ async function callPluginSessionActionForTest(params: {
     } as GatewayClient,
     isWebchatConnect: () => false,
     respond,
-    context: {
-      getRuntimeConfig: () => ({
-        agents: { defaults: { model: { primary: "openai/pr-bridge-test" } } },
-        models: {
-          providers: {
-            openai: { models: [{ id: "pr-bridge-test", contextTokens: 64_000 }] },
-          },
-        },
-      }),
-    } as never,
+    context: (params.context ?? createSessionActionContextForTest()) as never,
   });
   return response ?? { ok: false, error: new Error("handler did not respond") };
 }
@@ -109,12 +168,9 @@ async function callPluginSessionActionThroughGatewayForTest(params: {
       },
     } as GatewayClient,
     isWebchatConnect: () => false,
-    context: {
-      logGateway: {
-        warn() {},
-      },
-      getRuntimeConfig: () => ({}),
-    } as unknown as Parameters<typeof handleGatewayRequest>[0]["context"],
+    context: createSessionActionContextForTest() as unknown as Parameters<
+      typeof handleGatewayRequest
+    >[0]["context"],
   });
   return response ?? { ok: false, error: new Error("handler did not respond") };
 }
@@ -140,19 +196,6 @@ function requireHookError(response: HookResponse): { code?: unknown; message?: u
   return error;
 }
 
-function requireObservedEvent(
-  observed: unknown[],
-  index: number,
-): { runId?: unknown; sessionKey?: unknown; stream?: unknown; data?: Record<string, unknown> } {
-  const event = observed[index] as
-    | { runId?: unknown; sessionKey?: unknown; stream?: unknown; data?: Record<string, unknown> }
-    | undefined;
-  if (!event) {
-    throw new Error(`expected observed event #${index + 1}`);
-  }
-  return event;
-}
-
 function registerActionFixture(params: {
   id: string;
   name?: string;
@@ -174,7 +217,6 @@ function registerActionFixture(params: {
 describe("plugin session actions", () => {
   afterEach(() => {
     setActivePluginRegistry(createEmptyPluginRegistry());
-    resetAgentEventsForTest();
   });
 
   it("initializes and registers typed session actions", () => {
@@ -400,6 +442,108 @@ describe("plugin session actions", () => {
 
     const denyAll = await callSchemaAction("deny-all", { payload: { rejected: true } });
     expect(requireHookError(denyAll).code).toBe("INVALID_REQUEST");
+  });
+
+  it("uses prepared session context limits instead of model defaults", async () => {
+    const handler = vi.fn(async ({ contextTokens }: PluginSessionActionContext) => ({
+      result: { contextTokens: contextTokens ?? null },
+    }));
+    const { registry } = registerActionFixture({
+      id: "prepared-context-fixture",
+      register(api) {
+        api.registerSessionAction({ id: "inspect", handler });
+      },
+    });
+    setActivePluginRegistry(registry.registry);
+
+    await expect(
+      callPluginSessionActionForTest({
+        body: sessionActionBody("prepared-context-fixture", "inspect", {
+          sessionKey: MAIN_SESSION_KEY,
+        }),
+        context: createSessionActionContextForTest({ projectedContextTokens: 32_000 }),
+      }),
+    ).resolves.toEqual({
+      ok: true,
+      payload: { ok: true, result: { contextTokens: 32_000 } },
+      error: undefined,
+    });
+    expect(handler).toHaveBeenCalledTimes(1);
+  });
+
+  it("uses the selected agent's prepared catalog when the session row is missing", async () => {
+    const handler = vi.fn(({ contextTokens }: PluginSessionActionContext) => ({
+      result: { contextTokens: contextTokens ?? null },
+    }));
+    const { registry } = registerActionFixture({
+      id: "prepared-catalog-fixture",
+      register(api) {
+        api.registerSessionAction({ id: "inspect", handler });
+      },
+    });
+    setActivePluginRegistry(registry.registry);
+    const catalogEntry = {
+      id: "pr-bridge-test",
+      name: "PR Bridge Test",
+      provider: "openai",
+      contextWindow: 24_000,
+    };
+
+    await expect(
+      callPluginSessionActionForTest({
+        body: sessionActionBody("prepared-catalog-fixture", "inspect", {
+          sessionKey: MAIN_SESSION_KEY,
+        }),
+        context: createSessionActionContextForTest({
+          modelCatalog: new Map([
+            ["other", { entries: [{ ...catalogEntry, contextWindow: 8_000 }] }],
+            ["main", { entries: [catalogEntry] }],
+          ]),
+        }),
+      }),
+    ).resolves.toEqual({
+      ok: true,
+      payload: { ok: true, result: { contextTokens: 24_000 } },
+      error: undefined,
+    });
+    expect(handler).toHaveBeenCalledTimes(1);
+  });
+
+  it("rechecks required action scopes after session readiness", async () => {
+    const handler = vi.fn(() => ({ result: { accepted: true } }));
+    const { registry } = registerActionFixture({
+      id: "prepared-scope-fixture",
+      register(api) {
+        api.registerSessionAction({ id: "approve", requiredScopes: [WRITE_SCOPE], handler });
+      },
+    });
+    setActivePluginRegistry(registry.registry);
+    const entered = createDeferredCore<void>();
+    const ready = createDeferredCore<void>();
+    const pending = callPluginSessionActionForTest({
+      body: sessionActionBody("prepared-scope-fixture", "approve", {
+        sessionKey: MAIN_SESSION_KEY,
+      }),
+      context: createSessionActionContextForTest({
+        beforeRead: () => {
+          entered.resolve();
+          return ready.promise;
+        },
+      }),
+    });
+    await entered.promise;
+    expect(handler).not.toHaveBeenCalled();
+    const registration = expectDefined(
+      registry.registry.sessionActions[0],
+      "prepared scope action registration",
+    );
+    registration.action.requiredScopes = [APPROVALS_SCOPE];
+    ready.resolve();
+    expect(requireHookError(await pending)).toMatchObject({
+      code: "FORBIDDEN",
+      message: `missing scope: ${APPROVALS_SCOPE}`,
+    });
+    expect(handler).not.toHaveBeenCalled();
   });
 
   it("validates plugin session action results before returning gateway payloads", async () => {
@@ -655,6 +799,7 @@ describe("plugin session actions", () => {
         actionId: "approve",
         sessionKey: MAIN_SESSION_KEY,
         agentId: "main",
+        contextTokens: 64_000,
         client: { connId: "test-client", scopes: [APPROVALS_SCOPE] },
       });
 
@@ -763,276 +908,5 @@ describe("plugin session actions", () => {
       "unknown plugin session action: failed-action-plugin/stale",
     );
     expect(handler).not.toHaveBeenCalled();
-  });
-
-  it("emits plugin-attributed agent events through the plugin API", () => {
-    const observed: unknown[] = [];
-    const unsubscribe = onAgentEvent((event) => observed.push(event));
-    const { config, registry } = createPluginRegistryFixture();
-    let bundledApi: OpenClawPluginApi | undefined;
-    let workspaceApi: OpenClawPluginApi | undefined;
-    registerTestPlugin({
-      registry,
-      config,
-      record: createPluginRecord({
-        id: "event-plugin",
-        name: "Event Plugin",
-        origin: "bundled",
-      }),
-      register(api) {
-        bundledApi = api;
-      },
-    });
-    registerTestPlugin({
-      registry,
-      config,
-      record: createPluginRecord({
-        id: "workspace-event-plugin",
-        name: "Workspace Event Plugin",
-        origin: "workspace",
-      }),
-      register(api) {
-        workspaceApi = api;
-      },
-    });
-    setActivePluginRegistry(registry.registry);
-
-    try {
-      expect(
-        bundledApi?.agent?.events.emitAgentEvent({
-          runId: "run-emit",
-          sessionKey: " agent:main:main ",
-          stream: "approval",
-          data: { state: "queued" },
-        }),
-      ).toEqual({ emitted: true, stream: "approval" });
-      expect(
-        bundledApi?.agent?.events.emitAgentEvent({
-          runId: "run-emit",
-          stream: "lifecycle",
-          data: { phase: "start" },
-        }),
-      ).toEqual({
-        emitted: false,
-        reason: "lifecycle start requires a finite startedAt timestamp",
-      });
-      expect(
-        bundledApi?.agent?.events.emitAgentEvent({
-          runId: "run-emit",
-          stream: "lifecycle",
-          data: { phase: "start", startedAt: 1_234 },
-        }),
-      ).toEqual({ emitted: true, stream: "lifecycle" });
-      expect(
-        workspaceApi?.emitAgentEvent({
-          runId: "run-emit",
-          stream: "lifecycle",
-          data: { phase: "end" },
-        }),
-      ).toEqual({ emitted: false, reason: "stream lifecycle is reserved for bundled plugins" });
-      expect(
-        workspaceApi?.emitAgentEvent({
-          runId: "run-emit",
-          stream: "assistant",
-          data: { text: "spoofed assistant output" },
-        }),
-      ).toEqual({ emitted: false, reason: "stream assistant is reserved for bundled plugins" });
-      expect(
-        workspaceApi?.emitAgentEvent({
-          runId: "run-emit",
-          stream: "other-plugin.workflow",
-          data: { state: "queued" },
-        }),
-      ).toEqual({
-        emitted: false,
-        reason: "stream other-plugin.workflow must be scoped to plugin workspace-event-plugin",
-      });
-      expect(
-        workspaceApi?.emitAgentEvent({
-          runId: "run-emit",
-          stream: "workspace-event-plugin.workflow",
-          data: { state: "queued" },
-        }),
-      ).toEqual({ emitted: true, stream: "workspace-event-plugin.workflow" });
-      expect(
-        bundledApi?.emitAgentEvent({
-          runId: "run-emit",
-          stream: "approval",
-          data: 1n as never,
-        }),
-      ).toEqual({ emitted: false, reason: "event data must be JSON-compatible" });
-    } finally {
-      unsubscribe();
-    }
-
-    expect(observed).toHaveLength(3);
-    const bundledEvent = requireObservedEvent(observed, 0);
-    expect(bundledEvent.runId).toBe("run-emit");
-    expect(bundledEvent.sessionKey).toBe("agent:main:main");
-    expect(bundledEvent.stream).toBe("approval");
-    expect(bundledEvent.data).toEqual({
-      state: "queued",
-      pluginId: "event-plugin",
-      pluginName: "Event Plugin",
-    });
-    const lifecycleEvent = requireObservedEvent(observed, 1);
-    expect(lifecycleEvent.stream).toBe("lifecycle");
-    expect(lifecycleEvent.data).toEqual({
-      phase: "start",
-      startedAt: 1_234,
-      pluginId: "event-plugin",
-      pluginName: "Event Plugin",
-    });
-    const workspaceEvent = requireObservedEvent(observed, 2);
-    expect(workspaceEvent.runId).toBe("run-emit");
-    expect(workspaceEvent.sessionKey).toBeUndefined();
-    expect(workspaceEvent.stream).toBe("workspace-event-plugin.workflow");
-    expect(workspaceEvent.data).toEqual({
-      state: "queued",
-      pluginId: "workspace-event-plugin",
-      pluginName: "Workspace Event Plugin",
-    });
-  });
-
-  it("blocks agent events from stale and non-activating plugin API closures", () => {
-    const observed: unknown[] = [];
-    const unsubscribe = onAgentEvent((event) => observed.push(event));
-    const { config, registry } = createPluginRegistryFixture();
-    let capturedApi: OpenClawPluginApi | undefined;
-    registerTestPlugin({
-      registry,
-      config,
-      record: createPluginRecord({
-        id: "stale-event-plugin",
-        name: "Stale Event Plugin",
-        origin: "bundled",
-      }),
-      register(api) {
-        capturedApi = api;
-      },
-    });
-    setActivePluginRegistry(registry.registry);
-    setActivePluginRegistry(createEmptyPluginRegistry());
-
-    try {
-      expect(
-        capturedApi?.emitAgentEvent({
-          runId: "stale-run",
-          stream: "approval",
-          data: { stale: true },
-        }),
-      ).toEqual({ emitted: false, reason: "plugin is not loaded" });
-
-      const neverActiveRegistry = createPluginRegistry({
-        logger: {
-          info() {},
-          warn() {},
-          error() {},
-          debug() {},
-        },
-        runtime: {} as never,
-      });
-      let neverActiveApi: OpenClawPluginApi | undefined;
-      registerTestPlugin({
-        registry: neverActiveRegistry,
-        config,
-        record: createPluginRecord({
-          id: "never-active-event-plugin",
-          name: "Never Active Event Plugin",
-          origin: "bundled",
-        }),
-        register(api) {
-          neverActiveApi = api;
-        },
-      });
-      expect(
-        neverActiveApi?.emitAgentEvent({
-          runId: "never-active-run",
-          stream: "approval",
-          data: { inactive: true },
-        }),
-      ).toEqual({ emitted: false, reason: "plugin is not loaded" });
-
-      const inactiveRegistry = createPluginRegistry({
-        logger: {
-          info() {},
-          warn() {},
-          error() {},
-          debug() {},
-        },
-        runtime: {} as never,
-        activateGlobalSideEffects: false,
-      });
-      let inactiveApi: OpenClawPluginApi | undefined;
-      registerTestPlugin({
-        registry: inactiveRegistry,
-        config,
-        record: createPluginRecord({
-          id: "inactive-event-plugin",
-          name: "Inactive Event Plugin",
-          origin: "bundled",
-        }),
-        register(api) {
-          inactiveApi = api;
-        },
-      });
-      expect(
-        inactiveApi?.emitAgentEvent({
-          runId: "inactive-run",
-          stream: "approval",
-          data: { inactive: true },
-        }),
-      ).toEqual({ emitted: false, reason: "global side effects disabled" });
-    } finally {
-      unsubscribe();
-    }
-
-    expect(observed).toEqual([]);
-  });
-
-  it("allows reactivated cached registries to emit agent events again", () => {
-    const observed: unknown[] = [];
-    const unsubscribe = onAgentEvent((event) => observed.push(event));
-    const { config, registry } = createPluginRegistryFixture();
-    let capturedApi: OpenClawPluginApi | undefined;
-    registerTestPlugin({
-      registry,
-      config,
-      record: createPluginRecord({
-        id: "reactivated-event-plugin",
-        name: "Reactivated Event Plugin",
-        origin: "bundled",
-      }),
-      register(api) {
-        capturedApi = api;
-      },
-    });
-
-    setActivePluginRegistry(registry.registry);
-    setActivePluginRegistry(createEmptyPluginRegistry());
-    setActivePluginRegistry(registry.registry);
-
-    try {
-      expect(
-        capturedApi?.emitAgentEvent({
-          runId: "reactivated-run",
-          stream: "approval",
-          data: { active: true },
-        }),
-      ).toEqual({ emitted: true, stream: "approval" });
-    } finally {
-      unsubscribe();
-    }
-
-    expect(observed).toHaveLength(1);
-    const reactivatedEvent = requireObservedEvent(observed, 0);
-    expect(reactivatedEvent.runId).toBe("reactivated-run");
-    expect(reactivatedEvent.sessionKey).toBeUndefined();
-    expect(reactivatedEvent.stream).toBe("approval");
-    expect(reactivatedEvent.data).toEqual({
-      active: true,
-      pluginId: "reactivated-event-plugin",
-      pluginName: "Reactivated Event Plugin",
-    });
   });
 });

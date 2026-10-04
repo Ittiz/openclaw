@@ -72,6 +72,46 @@ afterEach(() => {
 });
 
 describe("PluginUiBridgeController", () => {
+  it.each([
+    ["non-finite number", { value: Number.NaN }],
+    ["infinity", { value: Number.POSITIVE_INFINITY }],
+    ["date", { value: new Date(0) }],
+    ["map", { value: new Map([["key", "value"]]) }],
+    ["nested undefined", { value: undefined }],
+    ["sparse array", { value: new Array(1) }],
+    ["bigint", { value: 1n }],
+    [
+      "cycle",
+      (() => {
+        const value: unknown[] = [];
+        value.push(value);
+        return value;
+      })(),
+    ],
+  ])("rejects a structured-clone %s before Gateway serialization", async (_name, payload) => {
+    const connected = await connectBridge();
+    try {
+      connected.childPort.postMessage({
+        v: 1,
+        type: "openclaw.pluginUi.sessionAction",
+        id: "invalid-payload",
+        actionId: "save",
+        contextRevision: 1,
+        payload,
+      });
+      await vi.waitFor(() => expect(connected.responses).toHaveLength(1));
+      expect(connected.request).not.toHaveBeenCalled();
+      expect(connected.responses[0]).toMatchObject({
+        id: "invalid-payload",
+        ok: false,
+        error: "Plugin UI action payload must be JSON-compatible",
+      });
+    } finally {
+      connected.bridge.clear();
+      connected.childPort.close();
+    }
+  });
+
   it("invokes only a declared plugin action with the parent session context", async () => {
     const request = vi.fn(async () => ({ ok: true, result: { saved: true } }));
     const connected = await connectBridge({ request, sessionActions: ["save"] });
